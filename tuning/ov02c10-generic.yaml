@@ -1,0 +1,20 @@
+# Software ISP tuning for the OV02C10, with a conservative generic colour
+# matrix. Rows sum to 1, so white balance is unaffected; it lifts saturation by
+# roughly 20% and is safe on any module.
+#
+# For a matrix measured on your own module, see tuning/extract-tuning.py.
+%YAML 1.1
+---
+version: 1
+algorithms:
+  - BlackLevel:
+  - Awb:
+  - Ccm:
+      ccms:
+        - ct: 6500
+          ccm: [  1.35, -0.30, -0.05,
+                 -0.15,  1.30, -0.15,
+                  0.05, -0.30,  1.25 ]
+  - Adjust:
+  - Agc:
+...

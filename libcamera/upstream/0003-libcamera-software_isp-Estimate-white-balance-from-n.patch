@@ -1,0 +1,323 @@
+From cf5a9cbae6a3e4b0ebafc3897e6a9cc04aad6e9a Mon Sep 17 00:00:00 2001
+From: Martin Neiva de Carvalho <martin@12100collective.com>
+Date: Wed, 26 Aug 2026 07:35:01 -0300
+Subject: [PATCH 3/5] libcamera: software_isp: Estimate white balance from
+ neutral pixels
+
+Grey world takes the whole frame as evidence of the illuminant. That
+holds for a scene whose colours average out, and fails for one with a
+large coloured object in it: the object's colour enters the estimate as
+though it were the light, and the correction that follows tints
+everything else the other way.
+
+Restrict the estimate to the pixels that the gains already in use bring
+close to neutral. Those are the ones the grey world assumption actually
+applies to, and iterating pulls the gains towards the illuminant rather
+than towards the average scene colour.
+
+Measured on a room with a wooden door filling about a fifth of the
+frame, against three white-painted surfaces as a reference: their
+combined deviation from neutral went from 0.059 to 0.026. The walls
+went from a red-to-green ratio of 0.950 to 0.986, with blue-to-green
+similarly improved.
+
+The selection has to happen while the statistics are gathered rather
+than in the IPA, because by the time the IPA sees them they are already
+summed, and a sum cannot be un-mixed. The gains therefore lag by one
+frame, which costs nothing here: the estimator is iterative anyway, and
+the iteration simply runs across frames instead of within one.
+
+Fall back to the whole frame when less than a twentieth of it looks
+neutral. That covers a genuinely monochrome scene, and it covers the
+first frames, where the gains have not converged, nothing would qualify,
+and the estimate could otherwise never get started.
+
+Signed-off-by: Martin Neiva de Carvalho <martin@12100collective.com>
+---
+ .../internal/software_isp/swisp_stats.h       | 13 +++
+ .../internal/software_isp/swstats_cpu.h       |  5 ++
+ src/ipa/softisp/algorithms/awb.cpp            | 20 ++++-
+ src/libcamera/software_isp/debayer_cpu.cpp    |  7 ++
+ src/libcamera/software_isp/debayer_egl.cpp    |  7 ++
+ src/libcamera/software_isp/swstats_cpu.cpp    | 85 +++++++++++++++++--
+ 6 files changed, 129 insertions(+), 8 deletions(-)
+
+diff --git a/include/libcamera/internal/software_isp/swisp_stats.h b/include/libcamera/internal/software_isp/swisp_stats.h
+index 77b70a251..577825c5e 100644
+--- a/include/libcamera/internal/software_isp/swisp_stats.h
++++ b/include/libcamera/internal/software_isp/swisp_stats.h
+@@ -39,6 +39,19 @@ struct SwIspStats {
+ 	 * level from the sums, which is a per-pixel offset.
+ 	 */
+ 	uint64_t sumSamples_;
++	/**
++	 * \brief Sums over only those sampled pixels that already look neutral
++	 *
++	 * Grey world assumes the scene averages to grey. One large coloured
++	 * object breaks that assumption and takes the estimate with it. These
++	 * sums cover only the pixels the current gains already bring close to
++	 * neutral, which is the same assumption applied where it holds.
++	 */
++	RGB<uint64_t> sumNeutral_;
++	/**
++	 * \brief Number of sampled pixels that contributed to sumNeutral_
++	 */
++	uint64_t sumNeutralSamples_;
+ 	/**
+ 	 * \brief Number of bins in the yHistogram
+ 	 */
+diff --git a/include/libcamera/internal/software_isp/swstats_cpu.h b/include/libcamera/internal/software_isp/swstats_cpu.h
+index 551870921..4453a1d4f 100644
+--- a/include/libcamera/internal/software_isp/swstats_cpu.h
++++ b/include/libcamera/internal/software_isp/swstats_cpu.h
+@@ -54,6 +54,7 @@ public:
+ 
+ 	int configure(const StreamConfiguration &inputCfg, unsigned int statsBufferCount = 1);
+ 	void setWindow(const Rectangle &window);
++	void setNeutralReference(const RGB<double> &gains, const RGB<double> &blackLevel);
+ 	void startFrame(uint32_t frame);
+ 	void finishFrame(uint32_t frame, uint32_t bufferId);
+ 	void processFrame(uint32_t frame, uint32_t bufferId, MappedFrameBuffer &input);
+@@ -106,6 +107,10 @@ private:
+ 
+ 	processFrameFn processFrame_;
+ 
++	/* Reference the neutral-pixel test is taken against, from the IPA. */
++	float neutralGains_[3] = { 1.0f, 1.0f, 1.0f };
++	float neutralBlack_ = 0.0f;
++
+ 	/* Variables set by configure(), used every line */
+ 	statsProcessFn stats0_;
+ 	statsProcessFn stats2_;
+diff --git a/src/ipa/softisp/algorithms/awb.cpp b/src/ipa/softisp/algorithms/awb.cpp
+index b48441987..65457e2dc 100644
+--- a/src/ipa/softisp/algorithms/awb.cpp
++++ b/src/ipa/softisp/algorithms/awb.cpp
+@@ -123,8 +123,24 @@ SoftIspAwbStats Awb::calculateRgbMeans(IPAContext &context,
+ 	 * Saturated pixels are not counted in the sums, so the number of
+ 	 * contributing pixels comes from the statistics rather than from the
+ 	 * histogram, which counts every pixel sampled.
++	 *
++	 * Prefer the pixels that already look neutral under the current gains.
++	 * Grey world takes the whole scene as evidence of the illuminant, so a
++	 * single large coloured object is enough to pull the estimate off it.
++	 * Fall back to the whole frame when too little of it qualifies - a
++	 * genuinely monochrome scene, or the first frames before the gains
++	 * have converged, where nothing would qualify and the estimate could
++	 * never get started.
+ 	 */
+-	const uint64_t nPixels = stats->sumSamples_;
++	constexpr double kMinNeutralFraction = 0.05;
++
++	uint64_t nPixels = stats->sumNeutralSamples_;
++	RGB<uint64_t> rawSum = stats->sumNeutral_;
++
++	if (nPixels < stats->sumSamples_ * kMinNeutralFraction) {
++		nPixels = stats->sumSamples_;
++		rawSum = stats->sum_;
++	}
+ 
+ 	/* Nothing but saturation was sampled, so there is nothing to say. */
+ 	if (!nPixels)
+@@ -142,7 +158,7 @@ SoftIspAwbStats Awb::calculateRgbMeans(IPAContext &context,
+ 	 * Make sure the sums are at least minValid, while preventing unsigned
+ 	 * integer underflow.
+ 	 */
+-	const RGB<uint64_t> sum = stats->sum_.max(offset + minValid) - offset;
++	const RGB<uint64_t> sum = rawSum.max(offset + minValid) - offset;
+ 
+ 	RGB<double> rgbMeans = { { static_cast<double>(sum.r()) / nPixels,
+ 				   static_cast<double>(sum.g()) / nPixels,
+diff --git a/src/libcamera/software_isp/debayer_cpu.cpp b/src/libcamera/software_isp/debayer_cpu.cpp
+index c6d5d1e18..9949a77ca 100644
+--- a/src/libcamera/software_isp/debayer_cpu.cpp
++++ b/src/libcamera/software_isp/debayer_cpu.cpp
+@@ -1052,6 +1052,13 @@ void DebayerCpu::process(uint32_t frame, FrameBuffer *input, FrameBuffer *output
+ 
+ 	updateLookupTables(params);
+ 
++	/*
++	 * The statistics need this frame's gains to tell which pixels already
++	 * look neutral. They cannot come from the IPA afterwards: by then the
++	 * sums are taken, and a sum cannot be un-mixed.
++	 */
++	stats_->setNeutralReference(params.gains, params.blackLevel);
++
+ 	/* Copy metadata from the input buffer */
+ 	FrameMetadata &metadata = output->_d()->metadata();
+ 	metadata.status = input->metadata().status;
+diff --git a/src/libcamera/software_isp/debayer_egl.cpp b/src/libcamera/software_isp/debayer_egl.cpp
+index 97aa03793..c042d3864 100644
+--- a/src/libcamera/software_isp/debayer_egl.cpp
++++ b/src/libcamera/software_isp/debayer_egl.cpp
+@@ -608,6 +608,13 @@ void DebayerEGL::process(uint32_t frame, FrameBuffer *input, FrameBuffer *output
+ 	egl_.assertThread();
+ 	bench_.startFrame();
+ 
++	/*
++	 * The statistics need this frame's gains to tell which pixels already
++	 * look neutral. They cannot come from the IPA afterwards: by then the
++	 * sums are taken, and a sum cannot be un-mixed.
++	 */
++	stats_->setNeutralReference(params.gains, params.blackLevel);
++
+ 	/* Copy metadata from the input buffer */
+ 	FrameMetadata &metadata = output->_d()->metadata();
+ 	metadata.status = input->metadata().status;
+diff --git a/src/libcamera/software_isp/swstats_cpu.cpp b/src/libcamera/software_isp/swstats_cpu.cpp
+index 4349adf15..c14f1dc6c 100644
+--- a/src/libcamera/software_isp/swstats_cpu.cpp
++++ b/src/libcamera/software_isp/swstats_cpu.cpp
+@@ -11,6 +11,8 @@
+ 
+ #include "libcamera/internal/software_isp/swstats_cpu.h"
+ 
++#include <cmath>
++
+ #include <libcamera/base/log.h>
+ 
+ #include <libcamera/stream.h>
+@@ -178,6 +180,17 @@ SwStatsCpu::SwStatsCpu(const CameraManager &cm)
+  */
+ static constexpr unsigned int kSaturationThreshold = 248;
+ 
++/*
++ * How far a pixel may sit from neutral, as a fraction of its own level, and
++ * still count as evidence of what neutral looks like. Loose enough that a
++ * typical scene keeps most of its pixels, because an estimator that discards
++ * almost everything is one awkward frame away from having nothing left.
++ */
++static constexpr float kNeutralTolerance = 0.20f;
++
++/* Below this level above black the channel ratios are mostly noise. */
++static constexpr float kNeutralMinLevel = 8.0f;
++
+ static constexpr unsigned int kRedYMul = 77; /* 0.299 * 256 */
+ static constexpr unsigned int kGreenYMul = 150; /* 0.587 * 256 */
+ static constexpr unsigned int kBlueYMul = 29; /* 0.114 * 256 */
+@@ -189,7 +202,11 @@ static constexpr unsigned int kBlueYMul = 29; /* 0.114 * 256 */
+ 	uint64_t sumR = 0;                \
+ 	uint64_t sumG = 0;                \
+ 	uint64_t sumB = 0;                \
+-	uint64_t nSamples = 0;
++	uint64_t nSamples = 0;            \
++	uint64_t sumNR = 0;               \
++	uint64_t sumNG = 0;               \
++	uint64_t sumNB = 0;               \
++	uint64_t nNeutral = 0;
+ 
+ #define SWSTATS_ACCUMULATE_LINE_STATS(div)      \
+ 	if (r < kSaturationThreshold * (div) && \
+@@ -199,6 +216,7 @@ static constexpr unsigned int kBlueYMul = 29; /* 0.114 * 256 */
+ 		sumG += g;                      \
+ 		sumB += b;                      \
+ 		nSamples++;                     \
++		SWSTATS_ACCUMULATE_NEUTRAL(div) \
+ 	}                                       \
+                                                 \
+ 	yVal = r * kRedYMul;                    \
+@@ -206,11 +224,42 @@ static constexpr unsigned int kBlueYMul = 29; /* 0.114 * 256 */
+ 	yVal += b * kBlueYMul;                  \
+ 	stats.yHistogram[yVal * SwIspStats::kYHistogramSize / (256 * 256 * (div))]++;
+ 
+-#define SWSTATS_FINISH_LINE_STATS() \
+-	stats.sum_.r() += sumR;     \
+-	stats.sum_.g() += sumG;     \
+-	stats.sum_.b() += sumB;     \
+-	stats.sumSamples_ += nSamples;
++/*
++ * Apply the gains the IPA settled on last frame and ask whether what comes out
++ * is neutral. It has to happen here rather than in the IPA: by the time the
++ * IPA sees the statistics they are already summed, and a sum cannot be
++ * un-mixed. One frame of lag on the gains costs nothing, the estimator being
++ * iterative by nature - the iteration simply runs across frames.
++ */
++#define SWSTATS_ACCUMULATE_NEUTRAL(div)                    \
++	{                                                  \
++		float black = neutralBlack_ * (div);       \
++		float nr = (r - black) * neutralGains_[0]; \
++		float ng = (g - black) * neutralGains_[1]; \
++		float nb = (b - black) * neutralGains_[2]; \
++		float mean = (nr + ng + nb) / 3.0f;        \
++		float tol = kNeutralTolerance * mean;      \
++                                                           \
++		if (mean > kNeutralMinLevel * (div) &&     \
++		    std::abs(nr - mean) < tol &&           \
++		    std::abs(ng - mean) < tol &&           \
++		    std::abs(nb - mean) < tol) {           \
++			sumNR += r;                        \
++			sumNG += g;                        \
++			sumNB += b;                        \
++			nNeutral++;                        \
++		}                                          \
++	}
++
++#define SWSTATS_FINISH_LINE_STATS()     \
++	stats.sum_.r() += sumR;         \
++	stats.sum_.g() += sumG;         \
++	stats.sum_.b() += sumB;         \
++	stats.sumSamples_ += nSamples;  \
++	stats.sumNeutral_.r() += sumNR; \
++	stats.sumNeutral_.g() += sumNG; \
++	stats.sumNeutral_.b() += sumNB; \
++	stats.sumNeutralSamples_ += nNeutral;
+ 
+ void SwStatsCpu::statsBGGR8Line0(const uint8_t *src[], SwIspStats &stats)
+ {
+@@ -393,6 +442,23 @@ void SwStatsCpu::statsGBRG12PLine0(const uint8_t *src[], SwIspStats &stats)
+ 	SWSTATS_FINISH_LINE_STATS()
+ }
+ 
++/**
++ * \brief Set what the neutral-pixel test measures against
++ * \param[in] gains Colour gains the IPA is currently applying
++ * \param[in] blackLevel Black level, normalised to [0,1]
++ *
++ * Called once per frame, before the statistics for that frame are gathered.
++ */
++void SwStatsCpu::setNeutralReference(const RGB<double> &gains,
++				     const RGB<double> &blackLevel)
++{
++	for (unsigned int i = 0; i < 3; i++)
++		neutralGains_[i] = static_cast<float>(gains[i]);
++
++	/* The line statistics work on an 8-bit scale times the format divisor. */
++	neutralBlack_ = static_cast<float>(blackLevel[1]) * 255.0f;
++}
++
+ /**
+  * \brief Reset state to start statistics gathering for a new frame
+  * \param[in] frame The frame number
+@@ -410,6 +476,8 @@ void SwStatsCpu::startFrame(uint32_t frame)
+ 	for (auto &s : stats_) {
+ 		s.sum_ = RGB<uint64_t>({ 0, 0, 0 });
+ 		s.sumSamples_ = 0;
++		s.sumNeutral_ = RGB<uint64_t>({ 0, 0, 0 });
++		s.sumNeutralSamples_ = 0;
+ 		s.yHistogram.fill(0);
+ 	}
+ }
+@@ -428,15 +496,20 @@ void SwStatsCpu::finishFrame(uint32_t frame, uint32_t bufferId)
+ 	if (valid) {
+ 		sharedStats_->sum_ = RGB<uint64_t>({ 0, 0, 0 });
+ 		sharedStats_->sumSamples_ = 0;
++		sharedStats_->sumNeutral_ = RGB<uint64_t>({ 0, 0, 0 });
++		sharedStats_->sumNeutralSamples_ = 0;
+ 		sharedStats_->yHistogram.fill(0);
+ 		for (const auto &s : stats_) {
+ 			sharedStats_->sum_ += s.sum_;
+ 			sharedStats_->sumSamples_ += s.sumSamples_;
++			sharedStats_->sumNeutral_ += s.sumNeutral_;
++			sharedStats_->sumNeutralSamples_ += s.sumNeutralSamples_;
+ 			for (unsigned int j = 0; j < SwIspStats::kYHistogramSize; j++)
+ 				sharedStats_->yHistogram[j] += s.yHistogram[j];
+ 		}
+ 
+ 		sharedStats_->sum_ >>= sumShift_;
++		sharedStats_->sumNeutral_ >>= sumShift_;
+ 	}
+ 
+ 	sharedStats_->valid = valid;
+-- 
+2.55.0
+

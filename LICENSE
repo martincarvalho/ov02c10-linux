@@ -1,0 +1,14 @@
+This repository carries work under two licences, matching the projects the
+pieces derive from.
+
+kernel/
+    GPL-2.0-only. Derived from the Linux ov02c10 driver.
+
+libcamera/
+    LGPL-2.1-or-later. Derived from libcamera.
+
+Everything else (scripts, tuning tools, documentation)
+    LGPL-2.1-or-later.
+
+No vendor tuning data is included. tuning/extract-tuning.py reads a file that
+is already on your machine, under whatever licence your camera driver carries.

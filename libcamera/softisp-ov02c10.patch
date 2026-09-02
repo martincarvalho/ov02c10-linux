@@ -1,0 +1,2012 @@
+diff --git i/include/libcamera/internal/software_isp/debayer_params.h w/include/libcamera/internal/software_isp/debayer_params.h
+index 6772b43bc..e2ff08067 100644
+--- i/include/libcamera/internal/software_isp/debayer_params.h
++++ w/include/libcamera/internal/software_isp/debayer_params.h
+@@ -23,8 +23,23 @@ struct DebayerParams {
+ 						 0.0, 0.0, 1.0 } };
+ 	RGB<float> blackLevel = RGB<float>({ 0.0, 0.0, 0.0 });
+ 	float gamma = 1.0;
++	float lensCentre[2] = { 0.5f, 0.5f };
++	float lensAspect = 1.0f;
++	float lensA[3] = { 0.0f, 0.0f, 0.0f };
++	float lensB[3] = { 0.0f, 0.0f, 0.0f };
++	float lensColour = 0.0f;
++	float lensLuma = 0.0f;
++	float toneLift = 0.0;
++	float toneContrast = 1.0;
++	float toneTarget = 0.45;
+ 	float contrastExp = 1.0;
+ 	RGB<float> gains = RGB<float>({ 1.0, 1.0, 1.0 });
++	/*
++	 * Analogue gain the sensor is running at, as a plain multiplier. Not
++	 * used to form the image - the sensor has already applied it - but a
++	 * debayer stage needs it to know how noisy the frame it was handed is.
++	 */
++	float analogueGain = 1.0;
+ };
+ 
+ } /* namespace libcamera */
+diff --git i/include/libcamera/internal/software_isp/swisp_stats.h w/include/libcamera/internal/software_isp/swisp_stats.h
+index d9d0d9be8..e7553a046 100644
+--- i/include/libcamera/internal/software_isp/swisp_stats.h
++++ w/include/libcamera/internal/software_isp/swisp_stats.h
+@@ -31,6 +31,28 @@ struct SwIspStats {
+ 	 * \brief Sums of colour channels of all the sampled pixels
+ 	 */
+ 	RGB<uint64_t> sum_;
++	/**
++	 * \brief Number of sampled pixels that contributed to sum_
++	 *
++	 * Saturated pixels are left out of the sums, so this is not the total
++	 * number of pixels sampled. Needed to subtract the black level from
++	 * the sums, which is a per-pixel offset.
++	 */
++	uint64_t sumSamples_;
++	/**
++	 * \brief Sums over only those sampled pixels that already look neutral
++	 *
++	 * Grey world assumes the scene averages to grey. A large coloured
++	 * object breaks that assumption and drags the estimate with it. These
++	 * sums are taken over the pixels that the current gains already bring
++	 * close to neutral, which is the same assumption applied only where it
++	 * holds.
++	 */
++	RGB<uint64_t> sumNeutral_;
++	/**
++	 * \brief Number of sampled pixels that contributed to sumNeutral_
++	 */
++	uint64_t sumNeutralSamples_;
+ 	/**
+ 	 * \brief Number of bins in the yHistogram
+ 	 */
+diff --git i/include/libcamera/internal/software_isp/swstats_cpu.h w/include/libcamera/internal/software_isp/swstats_cpu.h
+index 551870921..8ee3c22c0 100644
+--- i/include/libcamera/internal/software_isp/swstats_cpu.h
++++ w/include/libcamera/internal/software_isp/swstats_cpu.h
+@@ -54,6 +54,7 @@ public:
+ 
+ 	int configure(const StreamConfiguration &inputCfg, unsigned int statsBufferCount = 1);
+ 	void setWindow(const Rectangle &window);
++	void setNeutralReference(const RGB<float> &gains, const RGB<float> &blackLevel);
+ 	void startFrame(uint32_t frame);
+ 	void finishFrame(uint32_t frame, uint32_t bufferId);
+ 	void processFrame(uint32_t frame, uint32_t bufferId, MappedFrameBuffer &input);
+@@ -106,6 +107,10 @@ private:
+ 
+ 	processFrameFn processFrame_;
+ 
++	/* Reference the neutral-pixel test is taken against, from the IPA. */
++	float neutralGains_[3] = { 1.0f, 1.0f, 1.0f };
++	float neutralBlack_ = 0.0f;
++
+ 	/* Variables set by configure(), used every line */
+ 	statsProcessFn stats0_;
+ 	statsProcessFn stats2_;
+diff --git i/src/ipa/libipa/camera_sensor_helper.cpp w/src/ipa/libipa/camera_sensor_helper.cpp
+index 9457d62b3..c8c5231cf 100644
+--- i/src/ipa/libipa/camera_sensor_helper.cpp
++++ w/src/ipa/libipa/camera_sensor_helper.cpp
+@@ -688,6 +688,23 @@ public:
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("ov08x40", CameraSensorHelperOv08x40)
+ 
++class CameraSensorHelperOv02c10 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperOv02c10()
++	{
++		/* From Linux kernel driver: BLC target 0x40 at 10 bits. */
++		blackLevel_ = 4096;
++		/*
++		 * The driver exposes V4L2_CID_ANALOGUE_GAIN with a minimum and
++		 * default of 0x10, which corresponds to unity gain, so the gain
++		 * code is expressed in 1/16th steps.
++		 */
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 16 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("ov02c10", CameraSensorHelperOv02c10)
++
+ class CameraSensorHelperOv2685 : public CameraSensorHelper
+ {
+ public:
+diff --git i/src/ipa/simple/algorithms/adjust.cpp w/src/ipa/simple/algorithms/adjust.cpp
+index 8bf39c4c8..f754e1b18 100644
+--- i/src/ipa/simple/algorithms/adjust.cpp
++++ w/src/ipa/simple/algorithms/adjust.cpp
+@@ -20,6 +20,8 @@ namespace libcamera {
+ namespace ipa::soft::algorithms {
+ 
+ constexpr float kDefaultContrast = 1.0f;
++/* Must match kToneTarget in agc.cpp: the contrast pivots where tone aimed. */
++constexpr float kToneTargetShared = 0.45f;
+ constexpr float kDefaultSaturation = 1.0f;
+ 
+ LOG_DEFINE_CATEGORY(IPASoftAdjust)
+@@ -106,9 +108,50 @@ void Adjust::prepare(IPAContext &context,
+ 		frameContext.saturation = saturation;
+ 	}
+ 
++	/*
++	 * The tone stage no longer multiplies the display gamma: it adds a
++	 * midtone lift on top of it, so that bringing the middle of the range
++	 * back does not drag the shadows up with it. See bayer_unpacked.frag.
++	 *
++	 * The gamma below is the display one alone; the lift is what the AGC
++	 * solved for, and the two are independent - one maps the range onto
++	 * the display, the other puts the scene in the middle of the range,
++	 * and neither can do the other's job.
++	 */
+ 	params->gamma = 1.0 / context.activeState.knobs.gamma;
++	params->toneLift = context.activeState.agc.toneGamma;
++
++	/*
++	 * Lens shading, measured on this module. Belongs in the tuning file
++	 * once the format grows a place for it; here while it is one module's
++	 * measurement and not yet a general mechanism.
++	 */
++	params->lensCentre[0] = 0.509f;
++	params->lensCentre[1] = 0.488f;
++	params->lensAspect = 9.0f / 16.0f;
++	params->lensA[0] = -1.477f; params->lensB[0] = 0.750f;
++	params->lensA[1] = -1.354f; params->lensB[1] = 0.635f;
++	params->lensA[2] = -1.366f; params->lensB[2] = 0.634f;
++	params->lensColour = 1.0f;
++	params->lensLuma = 0.0f;
++
++	const char *env = utils::secure_getenv("LIBCAMERA_LENS_COLOUR");
++	if (env)
++		params->lensColour = atof(env);
++	env = utils::secure_getenv("LIBCAMERA_LENS_LUMA");
++	if (env)
++		params->lensLuma = atof(env);
++	params->toneContrast = context.activeState.agc.toneContrast;
++	params->toneTarget = kToneTargetShared;
+ 	const float contrast = context.activeState.knobs.contrast.value_or(kDefaultContrast);
+ 	params->contrastExp = tan(std::clamp(contrast * M_PI_4, 0.0, M_PI_2 - 0.00001));
++
++	/*
++	 * Hand the debayer the gain the AGC settled on. Because the AGC holds
++	 * the output level steady, gain is a direct read-out of how little
++	 * light the scene gave: the noise power of the frame tracks it.
++	 */
++	params->analogueGain = context.activeState.agc.again;
+ }
+ 
+ void Adjust::process([[maybe_unused]] IPAContext &context,
+diff --git i/src/ipa/simple/algorithms/agc.cpp w/src/ipa/simple/algorithms/agc.cpp
+index a13a75528..46ded5a7c 100644
+--- i/src/ipa/simple/algorithms/agc.cpp
++++ w/src/ipa/simple/algorithms/agc.cpp
+@@ -12,6 +12,7 @@
+ #include <stdint.h>
+ 
+ #include <libcamera/base/log.h>
++#include <libcamera/base/utils.h>
+ 
+ #include "control_ids.h"
+ 
+@@ -39,6 +40,30 @@ static constexpr float kExposureOptimal = kExposureBinsCount / 2.0;
+  */
+ static constexpr float kExposureSatisfactory = 0.2;
+ 
++/*
++ * How much of the frame may sit at the top of the range before the exposure
++ * is held back. A few percent is normal - a lamp, a window frame, a specular
++ * highlight - and clamping those would needlessly darken everything else.
++ */
++static constexpr double kMaxSaturatedFraction = 0.03;
++
++/* Where the median of a well exposed picture should land, after gamma. */
++static constexpr double kToneTarget = 0.45;
++/* Below this the median carries no usable information about the scene. */
++static constexpr double kMinToneMedian = 0.002;
++/*
++ * Bounds on the midtone lift. The curve y + s*y*(1-y) is monotonic for s in
++ * [-1, 1]; outside that it folds back and the picture inverts somewhere.
++ */
++/* How much the display-domain curve steepens about the target. 1 is off. */
++static constexpr double kToneContrast = 1.6;
++static constexpr double kMinToneLift = -0.9;
++static constexpr double kMaxToneLift = 0.9;
++/* Fraction of the way to the new value each frame. */
++static constexpr double kToneSpeed = 0.08;
++
++
++
+ /*
+  * Proportional gain for exposure/gain adjustment. Maps the MSV error to a
+  * multiplicative correction factor:
+@@ -61,17 +86,47 @@ static constexpr float kExpProportionalGain = 0.04;
+  */
+ static constexpr float kExpMaxStep = 0.15;
+ 
++
+ Agc::Agc()
+ {
+ }
+ 
+-void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV)
++void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext,
++			 double exposureMSV, double saturatedFraction)
+ {
+ 	int32_t &exposure = frameContext.sensor.exposure;
+ 	double &again = frameContext.sensor.gain;
+ 
+ 	double error = kExposureOptimal - exposureMSV;
+ 
++	/*
++	 * Highlight protection.
++	 *
++	 * The mean sample value cannot see clipping: a saturated pixel and a
++	 * merely bright one land in the same bin, so the mean can sit exactly
++	 * on target while a third of the frame is already pure white. Measured
++	 * on a laptop sensor facing a window, 33% of the frame was clipped
++	 * with the metering perfectly happy and 25x of gain still in hand.
++	 *
++	 * Clipping is not recoverable by anything downstream, so treat it as
++	 * a ceiling rather than as another term to average in: while too much
++	 * of the frame is saturated, never ask for more light, and ask for
++	 * less in proportion to the excess. Once back under the limit the
++	 * mean is free to drive again, which keeps the two from oscillating
++	 * against each other.
++	 */
++	double maxSaturated = kMaxSaturatedFraction;
++	const char *env = utils::secure_getenv("LIBCAMERA_AGC_MAX_SAT");
++
++	if (env)
++		maxSaturated = atof(env);
++
++	if (maxSaturated > 0.0 && saturatedFraction > maxSaturated) {
++		double excess = saturatedFraction / maxSaturated;
++
++		error = std::min(error, -std::log2(excess));
++	}
++
+ 	if (std::abs(error) <= kExposureSatisfactory)
+ 		return;
+ 
+@@ -120,6 +175,7 @@ void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, dou
+ 
+ 	LOG(IPASoftExposure, Debug)
+ 		<< "exposureMSV " << exposureMSV
++		<< " sat " << saturatedFraction
+ 		<< " error " << error << " factor " << factor
+ 		<< " exp " << exposure << " again " << again;
+ }
+@@ -136,6 +192,7 @@ void Agc::process(IPAContext &context,
+ 	metadata.set(controls::AnalogueGain, frameContext.sensor.gain);
+ 
+ 	if (!context.activeState.agc.valid) {
++		context.activeState.agc.toneGamma = 0.0;
+ 		/*
+ 		 * Init active-state from sensor values in case updateExposure()
+ 		 * does not run for the first frame.
+@@ -189,7 +246,112 @@ void Agc::process(IPAContext &context,
+ 	}
+ 
+ 	float exposureMSV = (denom == 0 ? 0 : static_cast<float>(num) / denom);
+-	updateExposure(context, frameContext, exposureMSV);
++
++	/*
++	 * Fraction of the frame that will come out clipped.
++	 *
++	 * Counting only the top of the raw histogram misses almost all of it.
++	 * The white balance gains are applied downstream, so a channel clips
++	 * in the output once its raw value passes the reciprocal of its gain
++	 * - with a blue gain of 2.4, raw at 42% of full scale is already pure
++	 * blue on the way out. Measured on this camera, a third of the frame
++	 * came out white while the top raw bin held 0.03% of it.
++	 *
++	 * Use the largest gain to find where the first channel starts to go,
++	 * and count from there.
++	 */
++	const auto &gains = context.activeState.awb.gains;
++	double maxGain = std::max({ (double)gains.r(), (double)gains.g(), (double)gains.b(), 1.0 });
++	unsigned int clipBin = static_cast<unsigned int>(
++		SwIspStats::kYHistogramSize / maxGain);
++
++	clipBin = std::clamp(clipBin, 1u, SwIspStats::kYHistogramSize - 1);
++
++	uint64_t total = std::accumulate(histogram.begin(), histogram.end(),
++					 uint64_t(0));
++	uint64_t saturated = 0;
++
++	for (unsigned int i = clipBin; i < SwIspStats::kYHistogramSize; i++)
++		saturated += histogram[i];
++
++	double saturatedFraction = total ? static_cast<double>(saturated) / total : 0.0;
++
++	LOG(IPASoftExposure, Debug) << "clip bin " << clipBin << " fraction " << saturatedFraction;
++
++	updateExposure(context, frameContext, exposureMSV, saturatedFraction);
++
++	/*
++	 * Tone.
++	 *
++	 * Protecting the highlights costs brightness everywhere else: the
++	 * exposure is now set by the brightest part of the scene rather than
++	 * by the average, so a backlit subject ends up dark. Recover the
++	 * middle of the range with gamma instead of with exposure, which
++	 * cannot clip what it lifts.
++	 *
++	 * The target is where the median of a well exposed picture sits.
++	 * Driven from the median rather than the mean so that a bright window
++	 * in the corner does not drag it.
++	 */
++	uint64_t half = total / 2;
++	uint64_t run = 0;
++	unsigned int medianBin = 0;
++
++	for (unsigned int i = 0; i < SwIspStats::kYHistogramSize; i++) {
++		run += histogram[i];
++		if (run >= half) {
++			medianBin = i;
++			break;
++		}
++	}
++
++	double median = (medianBin + 0.5) / SwIspStats::kYHistogramSize;
++	double blackFraction = context.activeState.blc.level / 255.0;
++
++	median = std::clamp((median - blackFraction) / (1.0 - blackFraction),
++			    kMinToneMedian, 1.0);
++
++	/*
++	 * Solve for the midtone lift that puts the median on target.
++	 *
++	 * The lift adds s * y * (1 - y) to the display-gamma'd value y, so
++	 * solving for the median is a division: it is zero at both ends of
++	 * the range and largest in the middle. Doing this with extra gamma
++	 * instead, as this used to, raises the shadows more than the midtones
++	 * - measured against a vendor ISP on the same camera and scene, hair
++	 * that sat at 41 out of 255 there came out at 90 here, and the whole
++	 * frame read as washed out.
++	 *
++	 * Held inside a range that cannot make the curve fold back on itself
++	 * (it stays monotonic between -1 and 1), and moved towards slowly: a
++	 * tone curve that keeps up with the scene is one the viewer sees
++	 * moving.
++	 */
++	double base = std::max<double>(context.activeState.knobs.gamma, 0.1);
++	double displayed = std::pow(median, 1.0 / base);
++	double room = displayed * (1.0 - displayed);
++	double wanted = room > 1e-4 ? (kToneTarget - displayed) / room : 0.0;
++
++	wanted = std::clamp(wanted, kMinToneLift, kMaxToneLift);
++
++	/*
++	 * Contrast is a fixed shape, not something solved per frame: the
++	 * spread a picture should have is a property of how it will be
++	 * looked at, not of the scene in front of it.
++	 */
++	context.activeState.agc.toneContrast = kToneContrast;
++
++	const char *contrastEnv = utils::secure_getenv("LIBCAMERA_AGC_CONTRAST");
++	if (contrastEnv)
++		context.activeState.agc.toneContrast = atof(contrastEnv);
++
++	double &tone = context.activeState.agc.toneGamma;
++
++	tone = tone <= 0.0 ? wanted : tone + (wanted - tone) * kToneSpeed;
++
++	LOG(IPASoftExposure, Debug)
++		<< "median " << median << " displayed " << displayed
++		<< " tone lift " << tone;
+ }
+ 
+ REGISTER_IPA_ALGORITHM(Agc, "Agc")
+diff --git i/src/ipa/simple/algorithms/agc.h w/src/ipa/simple/algorithms/agc.h
+index 112d9f5a1..f311b074e 100644
+--- i/src/ipa/simple/algorithms/agc.h
++++ w/src/ipa/simple/algorithms/agc.h
+@@ -25,7 +25,8 @@ public:
+ 		     ControlList &metadata) override;
+ 
+ private:
+-	void updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV);
++	void updateExposure(IPAContext &context, IPAFrameContext &frameContext,
++			    double exposureMSV, double saturatedFraction);
+ };
+ 
+ } /* namespace ipa::soft::algorithms */
+diff --git i/src/ipa/simple/algorithms/awb.cpp w/src/ipa/simple/algorithms/awb.cpp
+index 05155c83d..d8d3747ca 100644
+--- i/src/ipa/simple/algorithms/awb.cpp
++++ w/src/ipa/simple/algorithms/awb.cpp
+@@ -7,7 +7,6 @@
+ 
+ #include "awb.h"
+ 
+-#include <numeric>
+ #include <stdint.h>
+ 
+ #include <libcamera/base/log.h>
+@@ -49,7 +48,6 @@ void Awb::process(IPAContext &context,
+ 		  const SwIspStats *stats,
+ 		  ControlList &metadata)
+ {
+-	const SwIspStats::Histogram &histogram = stats->yHistogram;
+ 	const uint8_t blackLevel = context.activeState.blc.level;
+ 
+ 	metadata.set(controls::ColourGains, { frameContext.gains.r(),
+@@ -63,15 +61,44 @@ void Awb::process(IPAContext &context,
+ 	 * would be off if they were computed from the whole brightness range
+ 	 * rather than from the sensor range.
+ 	 */
+-	const uint64_t nPixels = std::accumulate(
+-		histogram.begin(), histogram.end(), uint64_t(0));
++	/*
++	 * Prefer the pixels that already look neutral under the current gains.
++	 * Grey world takes the whole scene as evidence of the illuminant, so
++	 * one large coloured object is enough to pull the estimate off: on a
++	 * test scene with a blue door, the walls came out five percent short
++	 * of red, and restricting the estimate to the neutral-looking pixels
++	 * brought that to one and a half.
++	 *
++	 * Fall back to the whole frame when too little of it looks neutral -
++	 * a genuinely monochrome scene, or the first frames before the gains
++	 * have converged, where nothing would qualify and the estimator would
++	 * otherwise have nothing to work from and never converge.
++	 */
++	constexpr double kMinNeutralFraction = 0.05;
++
++	uint64_t nPixels = stats->sumNeutralSamples_;
++	RGB<uint64_t> rawSum = stats->sumNeutral_;
++
++	if (nPixels < stats->sumSamples_ * kMinNeutralFraction) {
++		nPixels = stats->sumSamples_;
++		rawSum = stats->sum_;
++	}
++
+ 	const uint64_t offset = blackLevel * nPixels;
++
++	/*
++	 * Everything sampled was saturated, so there is nothing to weigh a
++	 * new estimate with. Keep the gains from the last frame that had
++	 * something to say.
++	 */
++	if (!nPixels)
++		return;
+ 	const uint64_t minValid = 1;
+ 	/*
+ 	 * Make sure the sums are at least minValid, while preventing unsigned
+ 	 * integer underflow.
+ 	 */
+-	const RGB<uint64_t> sum = stats->sum_.max(offset + minValid) - offset;
++	const RGB<uint64_t> sum = rawSum.max(offset + minValid) - offset;
+ 
+ 	/*
+ 	 * Calculate red and blue gains for AWB.
+diff --git i/src/ipa/simple/ipa_context.h w/src/ipa/simple/ipa_context.h
+index 8ccfacb46..119352af8 100644
+--- i/src/ipa/simple/ipa_context.h
++++ w/src/ipa/simple/ipa_context.h
+@@ -40,6 +40,13 @@ struct IPAActiveState {
+ 		int32_t exposure;
+ 		double again;
+ 		bool valid;
++		/*
++		 * Extra gamma the tone stage applies, so that holding the
++		 * exposure back to protect the highlights does not simply
++		 * leave the whole picture dark.
++		 */
++		double toneGamma;
++		double toneContrast;
+ 	} agc;
+ 
+ 	struct {
+diff --git i/src/ipa/simple/soft_simple.cpp w/src/ipa/simple/soft_simple.cpp
+index 629e1a32d..c59f35aa0 100644
+--- i/src/ipa/simple/soft_simple.cpp
++++ w/src/ipa/simple/soft_simple.cpp
+@@ -228,10 +228,31 @@ int IPASoftSimple::configure(const IPAConfigInfo &configInfo)
+ 		context_.configuration.agc.againMin = camHelper_->gain(againMin);
+ 		context_.configuration.agc.againMax = camHelper_->gain(againMax);
+ 		context_.configuration.agc.again10 = std::max(context_.configuration.agc.againMin, 1.0);
++		/*
++		 * The smallest gain change the sensor can actually make.
++		 *
++		 * The AGC needs this to know when a multiplicative correction
++		 * is too small to reach the next gain code, so that it steps
++		 * by one code instead of asking for a change that quantises
++		 * away and stalls the loop.
++		 *
++		 * Taking a fixed fraction of the total range instead ties the
++		 * step to how much gain the sensor happens to offer, which is
++		 * unrelated to how finely it can be set. On a sensor whose
++		 * range runs from 1 to 247 that fraction is 2.46, so the
++		 * smallest correction the AGC can make is 12% at a typical
++		 * indoor gain - far larger than the correction it wants. The
++		 * loop then cannot settle: every step crosses the target and
++		 * the exposure oscillates about it indefinitely, which is
++		 * plainly visible as the picture pulsing.
++		 */
+ 		context_.configuration.agc.againMinStep =
+-			(context_.configuration.agc.againMax -
+-			 context_.configuration.agc.againMin) /
+-			100.0;
++			camHelper_->gain(againMin + 1) -
++			camHelper_->gain(againMin);
++		/* Measurement knob: reinstate the old step to A/B against. */
++		const char *stepEnv = utils::secure_getenv("LIBCAMERA_AGC_MINSTEP");
++		if (stepEnv)
++			context_.configuration.agc.againMinStep = atof(stepEnv);
+ 		if (camHelper_->blackLevel().has_value()) {
+ 			/*
+ 			 * The black level from camHelper_ is a 16 bit value, software ISP
+diff --git i/src/libcamera/shaders/bayer_unpacked.frag w/src/libcamera/shaders/bayer_unpacked.frag
+index 10c5e941b..25a6e65dd 100644
+--- i/src/libcamera/shaders/bayer_unpacked.frag
++++ w/src/libcamera/shaders/bayer_unpacked.frag
+@@ -22,12 +22,29 @@ precision highp float;
+ /** Monochrome RGBA or GL_LUMINANCE Bayer encoded texture.*/
+ uniform sampler2D       tex_y;
+ varying vec4            center;
++varying vec2            lensPos;
+ varying vec4            yCoord;
+ varying vec4            xCoord;
+ uniform vec3            awb;
+ uniform mat3            ccm;
+ uniform vec3            blacklevel;
+ uniform float           gamma;
++/** Midtone lift; see below. Zero leaves the curve alone. */
++/** Lens shading: centre of the field, in texture coordinates. */
++uniform vec2            lensCentre;
++/** Vertical scale that turns texture coordinates into real distance. */
++uniform float           lensAspect;
++/** Field coefficients per channel, for r^2 and r^4. */
++uniform vec3            lensA;
++uniform vec3            lensB;
++/** How much of the colour and of the brightness falloff to take out. */
++uniform float           lensColour;
++uniform float           lensLuma;
++uniform float           toneLift;
++/** Contrast applied about the target, in the display domain. 1 disables. */
++uniform float           toneContrast;
++/** Where the tone stage aimed, and so where the contrast pivots. */
++uniform float           toneTarget;
+ uniform float           contrastExp;
+ 
+ float apply_contrast(float value)
+@@ -135,12 +152,56 @@ void main(void) {
+      */
+     rgb = (rgb - blacklevel) / (1.0 - blacklevel);
+ 
++    /*
++     * Undo the lens falling off towards the edges of the frame.
++     *
++     * Measured on this module with a sheet of paper against the lens, lit
++     * from behind by a white screen: the corners receive a quarter of the
++     * light the centre does, and not evenly across the channels - red falls
++     * eleven percent further than green, which is what tints the edges of a
++     * face that is not centred.
++     *
++     * The two halves of that are corrected separately because they cost
++     * differently. Flattening the colour is nearly free: the gains are a few
++     * percent, and what it buys is an edge that matches the middle.
++     * Flattening the brightness needs a gain of four at the corners, and
++     * multiplies the noise there by the same four, so how much of it to take
++     * is a judgement rather than a correction, and lensLuma carries it.
++     *
++     * The field is the classic 1 + a*r^2 + b*r^4, with r measured from the
++     * optical centre and the vertical axis scaled so that r is a real
++     * distance on a sensor that is not square. Fitted, it holds to about two
++     * percent, which is nothing against the factor of four it removes.
++     */
++    if (lensLuma > 0.0 || lensColour > 0.0) {
++        vec2 d = (lensPos - lensCentre) * vec2(1.0, lensAspect);
++        float r2 = dot(d, d) * 4.0;
++        vec3 field = vec3(1.0) + lensA * r2 + lensB * (r2 * r2);
++
++        field = max(field, vec3(0.05));
++
++        /* Colour first, as a ratio against green, then luminance. */
++        vec3 colour = field / field.g;
++
++        rgb /= pow(colour, vec3(lensColour)) * pow(vec3(field.g), vec3(lensLuma));
++    }
++
+     /* Apply AWB gains, and saturate each channel at sensor range */
+     rgb = clamp(rgb * awb, vec3(0.0), vec3(1.0));
+ 
+     /* Colour Correction Matrix */
+     rgb = ccm * rgb;
+ 
++    /*
++     * The matrix has negative off-diagonal terms, so a saturated colour can
++     * leave the [0,1] range - measured at 2.4% of pixels on this sensor,
++     * with red reaching -0.22. The gamma below is a pow(), which GLSL ES
++     * leaves undefined for a negative base, so those pixels would take
++     * whatever the driver happens to produce. Bring them back to the gamut
++     * first.
++     */
++    rgb = clamp(rgb, vec3(0.0), vec3(1.0));
++
+     /*
+      * Contrast
+      */
+@@ -152,6 +213,45 @@ void main(void) {
+     /* Apply gamma after colour correction */
+     rgb = pow(rgb, vec3(gamma));
+ 
++    /*
++     * Lift the middle of the range without lifting its ends.
++     *
++     * Metering for the highlights leaves the picture dark, and the middle has
++     * to be brought back. Doing it with more gamma raises the shadows further
++     * than the midtones, so black stops being black: measured against the
++     * same camera under a vendor ISP, hair that should sit at 41 out of 255
++     * came out at 90, the picture read as washed out, and colour went with it
++     * - a curve that compresses the bottom of the range compresses the
++     * differences between channels there too.
++     *
++     * y * (1 - y) is zero at both ends and largest in the middle, so adding a
++     * multiple of it moves the midtones and leaves black at black and white
++     * at white. It stays monotonic for any lift between -1 and 1.
++     */
++    rgb = rgb + toneLift * rgb * (vec3(1.0) - rgb);
++
++    /*
++     * Then put the contrast back, pivoting where the tone stage aimed.
++     *
++     * Placing the median is only half of fitting a scene into the range; how
++     * far it spreads either side is the other half, and metering for the
++     * highlights flattens that spread. Measured against a vendor ISP on the
++     * same scene, it put 4.3% of the frame below 32 out of 255 and a quarter
++     * of it between 160 and 192, while this pipeline put 0.2% and 11% there
++     * and bunched 71% of the picture into the middle third.
++     *
++     * The existing contrast stage cannot do this: it runs before the gamma
++     * and pivots at 0.5, which after the gamma sits at 0.73 - near white,
++     * not near the middle. Pivot at the tone target instead, so the point
++     * the tone stage just placed is the one the curve holds still.
++     */
++    if (toneContrast != 1.0) {
++        vec3 lo = vec3(toneTarget) * pow(rgb / vec3(toneTarget), vec3(toneContrast));
++        vec3 hi = vec3(1.0) - (1.0 - toneTarget) *
++                  pow((vec3(1.0) - rgb) / (1.0 - toneTarget), vec3(toneContrast));
++        rgb = mix(lo, hi, step(vec3(toneTarget), rgb));
++    }
++
+ #if defined (SWAP_BLUE)
+     gl_FragColor = vec4(rgb.bgr, 1.0);
+ #else
+diff --git i/src/libcamera/shaders/bayer_unpacked.vert w/src/libcamera/shaders/bayer_unpacked.vert
+index 423dde0fa..4e1d0daf6 100644
+--- i/src/libcamera/shaders/bayer_unpacked.vert
++++ w/src/libcamera/shaders/bayer_unpacked.vert
+@@ -31,6 +31,8 @@ uniform vec2            tex_bayer_first_red;
+ /** .xy = Pixel being sampled in the fragment shader on the range [0, 1]
+     .zw = ...on the range [0, sourceSize], offset by firstRed */
+ varying vec4            center;
++/** Position across the image, 0 to 1, for the lens shading field. */
++varying vec2            lensPos;
+ 
+ /** center.x + (-2/w, -1/w, 1/w, 2/w); These are the x-positions */
+ /** of the adjacent pixels.*/
+@@ -44,6 +46,7 @@ uniform float stride_factor;
+ 
+ void main(void) {
+     center.xy = vec2(textureIn.x * stride_factor, textureIn.y);
++    lensPos = textureIn;
+     center.zw = textureIn * tex_size + tex_bayer_first_red;
+ 
+     xCoord = center.x + vec4(-2.0 * tex_step.x,
+diff --git i/src/libcamera/shaders/meson.build w/src/libcamera/shaders/meson.build
+index c409ff9b0..c4aed68c9 100644
+--- i/src/libcamera/shaders/meson.build
++++ w/src/libcamera/shaders/meson.build
+@@ -7,6 +7,10 @@ shader_files = files([
+     'bayer_unpacked.frag',
+     'bayer_unpacked.vert',
+     'identity.vert',
++    'temporal_denoise.frag',
++    'sharpen.frag',
++    'pyramid.frag',
++    'motion.frag',
+ ])
+ 
+ # Generate header from shaders
+diff --git i/src/libcamera/software_isp/debayer_egl.cpp w/src/libcamera/software_isp/debayer_egl.cpp
+index 02651fe87..d84cb478c 100644
+--- i/src/libcamera/software_isp/debayer_egl.cpp
++++ w/src/libcamera/software_isp/debayer_egl.cpp
+@@ -10,6 +10,7 @@
+ #include "debayer_egl.h"
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <assert.h>
+ #include <memory>
+ #include <stdlib.h>
+@@ -120,6 +121,15 @@ int DebayerEGL::getShaderVariableLocations(void)
+ 	ccmUniformDataIn_ = glGetUniformLocation(programId_, "ccm");
+ 	blackLevelUniformDataIn_ = glGetUniformLocation(programId_, "blacklevel");
+ 	gammaUniformDataIn_ = glGetUniformLocation(programId_, "gamma");
++	lensCentreUniform_ = glGetUniformLocation(programId_, "lensCentre");
++	lensAspectUniform_ = glGetUniformLocation(programId_, "lensAspect");
++	lensAUniform_ = glGetUniformLocation(programId_, "lensA");
++	lensBUniform_ = glGetUniformLocation(programId_, "lensB");
++	lensColourUniform_ = glGetUniformLocation(programId_, "lensColour");
++	lensLumaUniform_ = glGetUniformLocation(programId_, "lensLuma");
++	toneLiftUniformDataIn_ = glGetUniformLocation(programId_, "toneLift");
++	toneContrastUniformDataIn_ = glGetUniformLocation(programId_, "toneContrast");
++	toneTargetUniformDataIn_ = glGetUniformLocation(programId_, "toneTarget");
+ 	contrastExpUniformDataIn_ = glGetUniformLocation(programId_, "contrastExp");
+ 
+ 	textureUniformStep_ = glGetUniformLocation(programId_, "tex_step");
+@@ -332,6 +342,15 @@ int DebayerEGL::configure(const StreamConfiguration &inputCfg,
+ 	outputSize_ = outputCfg.size;
+ 	nativeOutputSize_ = outSizeRange.max;
+ 
++	/*
++	 * Run the internal passes at the sensor's native output. Reducing to
++	 * the caller's size by point sampling, as the projection matrix alone
++	 * would do, discards the noise reduction that averaging the discarded
++	 * pixels would have given for free - measured at 5.5 dB going to VGA,
++	 * and unlike temporal filtering it costs nothing on a moving subject.
++	 */
++	workSize_ = nativeOutputSize_;
++
+ 	window_.x = ((inputCfg.size.width - outputCfg.size.width) / 2) &
+ 		    ~(inputConfig_.patternSize.width - 1);
+ 	window_.y = ((inputCfg.size.height - outputCfg.size.height) / 2) &
+@@ -340,10 +359,25 @@ int DebayerEGL::configure(const StreamConfiguration &inputCfg,
+ 	window_.height = outputCfg.size.height;
+ 
+ 	/*
+-	 * Don't pass x,y from window_ since process() already adjusts for it.
+-	 * But crop the window to 2/3 of its width and height for speedup.
++	 * Meter over the whole frame, because that is what is shown.
++	 *
++	 * The window is given to the statistics as a region of the INPUT
++	 * buffer, and the comment this replaces was inherited from the CPU
++	 * debayer, where process() offsets the source pointer by the window's
++	 * origin before handing it over. Nothing offsets it here, so passing
++	 * only a size anchors the window at the corner of the sensor frame,
++	 * and its size follows whatever the caller asked for: metering a
++	 * 640x480 stream read the top left fifteen percent of the picture and
++	 * nothing else, while a 1080p stream from the same camera metered
++	 * nearly all of it. Exposure and white balance therefore depended on
++	 * the resolution the application happened to request.
++	 *
++	 * Every pass here runs at the sensor's native output and the reduction
++	 * to the requested size averages all of it, so the whole frame is
++	 * shown whatever the size, and the whole frame is what should be
++	 * measured.
+ 	 */
+-	stats_->setWindow(Rectangle(window_.size()));
++	stats_->setWindow(Rectangle(inputCfg.size));
+ 
+ 	inputBufferCount_ = inputCfg.bufferCount;
+ 	outputBufferCount_ = outputCfg.bufferCount;
+@@ -409,8 +443,16 @@ void DebayerEGL::setShaderVariableValues(eGLImage &eglImageIn, const DebayerPara
+ 	 * the input size. Keep the aspect ratio and prefer cropping over black
+ 	 * bars.
+ 	 */
+-	GLfloat scale = std::max((GLfloat)outputSize_.width / nativeOutputSize_.width,
+-				 (GLfloat)outputSize_.height / nativeOutputSize_.height);
++	/*
++	 * With the internal passes running at native resolution the debayer
++	 * renders the whole frame and the reduction happens at the end. The
++	 * old scale-and-crop projection is still used when those passes are
++	 * not running, so the fallback path is unchanged.
++	 */
++	GLfloat scale = tdnEnabled_
++			      ? 1.0f
++			      : std::max((GLfloat)outputSize_.width / nativeOutputSize_.width,
++					 (GLfloat)outputSize_.height / nativeOutputSize_.height);
+ 	GLfloat trans = -(1.0f - scale);
+ 	GLfloat projMatrix[] = {
+ 		scale, 0, 0, 0,
+@@ -496,6 +538,15 @@ void DebayerEGL::setShaderVariableValues(eGLImage &eglImageIn, const DebayerPara
+ 	 * Gamma
+ 	 */
+ 	glUniform1f(gammaUniformDataIn_, params.gamma);
++	glUniform2fv(lensCentreUniform_, 1, params.lensCentre);
++	glUniform1f(lensAspectUniform_, params.lensAspect);
++	glUniform3fv(lensAUniform_, 1, params.lensA);
++	glUniform3fv(lensBUniform_, 1, params.lensB);
++	glUniform1f(lensColourUniform_, params.lensColour);
++	glUniform1f(lensLumaUniform_, params.lensLuma);
++	glUniform1f(toneLiftUniformDataIn_, params.toneLift);
++	glUniform1f(toneContrastUniformDataIn_, params.toneContrast);
++	glUniform1f(toneTargetUniformDataIn_, params.toneTarget);
+ 	LOG(Debayer, Debug) << " gammaUniformDataIn_ " << gammaUniformDataIn_ << " data " << params.gamma;
+ 
+ 	/*
+@@ -589,6 +640,736 @@ eGLImage *DebayerEGL::getCachedOutputFrameBuffer(FrameBuffer *output)
+ 	return eglImageOut;
+ }
+ 
++
++namespace {
++
++/* Below this gain the picture is clean enough that filtering only risks harm. */
++constexpr float kTdnGainOff = 2.0f;
++/* At and above this gain the filter runs at the strength it was tuned for. */
++constexpr float kTdnGainFull = 8.0f;
++/* Gain the residual noise figure below is quoted at. */
++constexpr float kNoiseRefGain = 248.0f;
++
++} /* namespace */
++
++/* Bias a stored displacement carries, so it can be negative. */
++constexpr float kMotionBias = 128.0f;
++
++/**
++ * \brief Draw a full screen quad with an identity projection
++ * \param[in] vertexAttr Vertex position attribute of the current program
++ * \param[in] textureAttr Texture coordinate attribute of the current program
++ * \param[in] projUniform Projection matrix uniform of the current program
++ * \param[in] strideUniform Stride factor uniform of the current program
++ * \param[in] viewport Size to render at
++ *
++ * Every pass after the debayer maps one texture straight onto its target, so
++ * they all want the same quad and the same identity projection.
++ */
++void DebayerEGL::drawQuad(GLint vertexAttr, GLint textureAttr, GLint projUniform,
++			  GLint strideUniform, const Size &viewport)
++{
++	static const GLfloat vcoordinates[4][2] = {
++		{ -1.0f, -1.0f }, { -1.0f, +1.0f }, { +1.0f, +1.0f }, { +1.0f, -1.0f },
++	};
++	static const GLfloat tcoordinates[4][2] = {
++		{ 0.0f, 0.0f }, { 0.0f, 1.0f }, { 1.0f, 1.0f }, { 1.0f, 0.0f },
++	};
++	static const GLfloat identityMatrix[] = {
++		1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f,
++		0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f,
++	};
++
++	glEnableVertexAttribArray(vertexAttr);
++	glVertexAttribPointer(vertexAttr, 2, GL_FLOAT, GL_TRUE,
++			      2 * sizeof(GLfloat), vcoordinates);
++	glEnableVertexAttribArray(textureAttr);
++	glVertexAttribPointer(textureAttr, 2, GL_FLOAT, GL_TRUE,
++			      2 * sizeof(GLfloat), tcoordinates);
++
++	glUniformMatrix4fv(projUniform, 1, GL_FALSE, identityMatrix);
++	glUniform1f(strideUniform, 1.0f);
++
++	glViewport(0, 0, viewport.width, viewport.height);
++	glDrawArrays(GL_TRIANGLE_FAN, 0, DEBAYER_OPENGL_COORDS);
++}
++
++/**
++ * \brief Compile and link the pyramid and motion search passes
++ * \return 0 on success, or a negative error code otherwise
++ */
++int DebayerEGL::initMotionSearch()
++{
++	std::vector<std::string> shaderEnv;
++	const char *env = utils::secure_getenv("LIBCAMERA_TDN_MOTION");
++	GLuint vs = 0, fs = 0;
++
++	/*
++	 * Off by default, because measurement says it does not pay for
++	 * itself here.
++	 *
++	 * Following the subject lets the filter keep averaging across
++	 * motion, and on a frame that is entirely moving it does: measured
++	 * against the same captured frames shifted four pixels per frame it
++	 * takes the error down by 5.6%. But over a background that is NOT
++	 * moving the true displacement is zero, every wrong vector breaks
++	 * the accumulation that the filter depends on, and the error goes UP
++	 * by 12.6%. A webcam frame is mostly background, so the trade is a
++	 * loss overall.
++	 *
++	 * The reason the gain is so small is that the blend is already
++	 * motion adaptive: where the picture moves it falls back on the
++	 * current frame by itself, so compensation is largely a substitute
++	 * for that rather than an addition to it. Against a fixed alpha
++	 * filter, which cannot fall back, the same search is worth 1.66x -
++	 * which is what made this look far more promising than it is.
++	 *
++	 * Kept, because it is the right tool for a pipeline that can trust
++	 * its vectors: given the true displacements the same filter reaches
++	 * an error a further 25% lower, so the ceiling is real and it is the
++	 * estimate, not the idea, that falls short.
++	 */
++	if (!env || atoi(env) == 0) {
++		motionEnabled_ = false;
++		LOG(Debayer, Info) << "Motion compensation disabled";
++		return 0;
++	}
++
++	egl_.pushEnv(shaderEnv, "#version 100");
++
++	auto build = [&](Span<const unsigned char> frag, GLuint &program) -> int {
++		if (egl_.compileVertexShader(vs, identity_vert, shaderEnv))
++			return -ENODEV;
++		utils::scope_exit vGuard([&] { glDeleteShader(vs); });
++
++		if (egl_.compileFragmentShader(fs, frag, shaderEnv))
++			return -ENODEV;
++		utils::scope_exit fGuard([&] { glDeleteShader(fs); });
++
++		return egl_.linkProgram(program, vs, fs) ? -ENODEV : 0;
++	};
++
++	if (build(pyramid_frag, pyramidProgramId_)) {
++		LOG(Debayer, Error) << "Pyramid pass failed to build";
++		return -ENODEV;
++	}
++
++	egl_.useProgram(pyramidProgramId_);
++	pyramidAttributeVertex_ = glGetAttribLocation(pyramidProgramId_, "vertexIn");
++	pyramidAttributeTexture_ = glGetAttribLocation(pyramidProgramId_, "textureIn");
++	pyramidUniformProjMatrix_ = glGetUniformLocation(pyramidProgramId_, "proj_matrix");
++	pyramidUniformStrideFactor_ = glGetUniformLocation(pyramidProgramId_, "stride_factor");
++	pyramidUniformSource_ = glGetUniformLocation(pyramidProgramId_, "tex_source");
++	pyramidUniformIsColour_ = glGetUniformLocation(pyramidProgramId_, "sourceIsColour");
++
++	if (build(motion_frag, motionProgramId_)) {
++		LOG(Debayer, Error) << "Motion pass failed to build";
++		return -ENODEV;
++	}
++
++	egl_.useProgram(motionProgramId_);
++	motionAttributeVertex_ = glGetAttribLocation(motionProgramId_, "vertexIn");
++	motionAttributeTexture_ = glGetAttribLocation(motionProgramId_, "textureIn");
++	motionUniformProjMatrix_ = glGetUniformLocation(motionProgramId_, "proj_matrix");
++	motionUniformStrideFactor_ = glGetUniformLocation(motionProgramId_, "stride_factor");
++	motionUniformCurrent_ = glGetUniformLocation(motionProgramId_, "tex_current");
++	motionUniformHistory_ = glGetUniformLocation(motionProgramId_, "tex_history");
++	motionUniformPrior_ = glGetUniformLocation(motionProgramId_, "tex_prior");
++	motionUniformStep_ = glGetUniformLocation(motionProgramId_, "tex_step");
++	motionUniformHasPrior_ = glGetUniformLocation(motionProgramId_, "hasPrior");
++	motionUniformRadius_ = glGetUniformLocation(motionProgramId_, "radius");
++	motionUniformRange_ = glGetUniformLocation(motionProgramId_, "mvBias");
++
++	LOG(Debayer, Info) << "Motion compensation enabled, " << kMotionLevels
++			   << " pyramid levels";
++
++	return 0;
++}
++
++/**
++ * \brief Allocate the pyramid and displacement textures
++ * \return 0 on success, or a negative error code otherwise
++ */
++int DebayerEGL::allocateMotionImages()
++{
++	Size size = workSize_;
++
++	for (unsigned int i = 0; i < kMotionLevels; i++) {
++		size.width = std::max(size.width / 2, 16u);
++		size.height = std::max(size.height / 2, 16u);
++		motion_[i].size = size;
++
++		std::unique_ptr<eGLImage> *images[] = {
++			&motion_[i].sceneLuma, &motion_[i].histLuma, &motion_[i].mv
++		};
++		unsigned int j = 0;
++
++		for (auto *image : images) {
++			unsigned int unit = 5 + i * 3 + j;
++
++			*image = std::make_unique<eGLImage>(GL_RGBA, size.width,
++							   size.height,
++							   size.width * 4,
++							   GL_TEXTURE0 + unit, unit);
++			egl_.createOutputTexture2D(**image);
++
++			/*
++			 * Linear on the luma levels, because halving the image
++			 * is done by letting the filter average each 2x2 block
++			 * in one fetch. Nearest on the displacement field: it
++			 * is data, and interpolating between two different
++			 * motions produces a third that matches neither.
++			 */
++			egl_.activateBindTexture(**image);
++			GLint filter = (j == 2) ? GL_NEAREST : GL_LINEAR;
++			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
++			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
++
++			egl_.attachTextureToFBO(**image);
++			glClear(GL_COLOR_BUFFER_BIT);
++			j++;
++		}
++	}
++
++	GLenum err = glGetError();
++	if (err != GL_NO_ERROR) {
++		LOG(Debayer, Error) << "Motion texture setup failed " << err;
++		for (unsigned int i = 0; i < kMotionLevels; i++) {
++			motion_[i].sceneLuma.reset();
++			motion_[i].histLuma.reset();
++			motion_[i].mv.reset();
++		}
++		return -ENODEV;
++	}
++
++	return 0;
++}
++
++/**
++ * \brief Build the pyramids and search them for the displacement field
++ *
++ * Runs before the temporal blend, which then uses the finest level to fetch
++ * the history from where the content actually was.
++ */
++void DebayerEGL::runMotionSearch()
++{
++	eGLImage &historyRead = *historyImage_[historyIndex_];
++
++	/* Both pyramids, coarsening one level at a time. */
++	egl_.useProgram(pyramidProgramId_);
++
++	for (unsigned int i = 0; i < kMotionLevels; i++) {
++		struct {
++			eGLImage &source;
++			eGLImage &dest;
++		} steps[] = {
++			{ i ? *motion_[i - 1].sceneLuma : *sceneImage_, *motion_[i].sceneLuma },
++			{ i ? *motion_[i - 1].histLuma : historyRead, *motion_[i].histLuma },
++		};
++
++		for (auto &step : steps) {
++			egl_.activateBindTexture(step.source);
++			glUniform1i(pyramidUniformSource_,
++				    step.source.texture_unit_uniform_id_);
++			glUniform1f(pyramidUniformIsColour_, i ? 0.0f : 1.0f);
++			egl_.attachTextureToFBO(step.dest);
++			drawQuad(pyramidAttributeVertex_, pyramidAttributeTexture_,
++				 pyramidUniformProjMatrix_, pyramidUniformStrideFactor_,
++				 motion_[i].size);
++		}
++	}
++
++	/* Search, coarsest first, each level starting from the one above it. */
++	egl_.useProgram(motionProgramId_);
++	glUniform1f(motionUniformRange_, kMotionBias);
++
++	for (int i = kMotionLevels - 1; i >= 0; i--) {
++		MotionLevel &level = motion_[i];
++		bool coarsest = (i == static_cast<int>(kMotionLevels) - 1);
++		GLfloat step[] = { 1.0f / level.size.width, 1.0f / level.size.height };
++
++		egl_.activateBindTexture(*level.sceneLuma);
++		egl_.activateBindTexture(*level.histLuma);
++		glUniform1i(motionUniformCurrent_, level.sceneLuma->texture_unit_uniform_id_);
++		glUniform1i(motionUniformHistory_, level.histLuma->texture_unit_uniform_id_);
++
++		if (!coarsest) {
++			eGLImage &prior = *motion_[i + 1].mv;
++
++			egl_.activateBindTexture(prior);
++			glUniform1i(motionUniformPrior_, prior.texture_unit_uniform_id_);
++		}
++
++		glUniform2fv(motionUniformStep_, 1, step);
++		glUniform1f(motionUniformHasPrior_, coarsest ? 0.0f : 1.0f);
++		glUniform1f(motionUniformRadius_, coarsest ? 2.0f : 1.0f);
++
++		egl_.attachTextureToFBO(*level.mv);
++		drawQuad(motionAttributeVertex_, motionAttributeTexture_,
++			 motionUniformProjMatrix_, motionUniformStrideFactor_,
++			 level.size);
++	}
++}
++
++/**
++ * \brief Compile and link the temporal denoise pass
++ *
++ * The pass reuses identity.vert: it draws a full screen quad over the
++ * already debayered scene, so it needs no projection of its own.
++ *
++ * \return 0 on success, or a negative error code otherwise
++ */
++int DebayerEGL::initTemporalDenoise()
++{
++	std::vector<std::string> shaderEnv;
++	const char *env;
++
++	env = utils::secure_getenv("LIBCAMERA_TDN");
++	if (env)
++		tdnEnabled_ = atoi(env) != 0;
++
++	if (!tdnEnabled_) {
++		LOG(Debayer, Info) << "Temporal denoise disabled";
++		return 0;
++	}
++
++	/*
++	 * The strength and the two motion thresholds are tunable from the
++	 * environment because the thresholds calibrate against sensor noise,
++	 * and that has to be measured on hardware rather than derived.
++	 */
++	env = utils::secure_getenv("LIBCAMERA_TDN_ALPHA");
++	if (env)
++		tdnAlphaMin_ = atof(env);
++	env = utils::secure_getenv("LIBCAMERA_TDN_LO");
++	if (env)
++		tdnMotionLo_ = atof(env);
++	env = utils::secure_getenv("LIBCAMERA_TDN_HI");
++	if (env)
++		tdnMotionHi_ = atof(env);
++	env = utils::secure_getenv("LIBCAMERA_TDN_CHROMA");
++	if (env)
++		tdnChromaSigma_ = atof(env);
++	env = utils::secure_getenv("LIBCAMERA_TDN_NOISE");
++	if (env)
++		tdnNoiseResidual_ = atof(env);
++	env = utils::secure_getenv("LIBCAMERA_TDN_CLAMP");
++	if (env)
++		tdnClampSigmas_ = atof(env);
++
++	egl_.pushEnv(shaderEnv, "#version 100");
++
++	if (egl_.compileVertexShader(tdnVertexShaderId_, identity_vert, shaderEnv)) {
++		LOG(Debayer, Error) << "Compile temporal denoise vertex shader fail";
++		return -ENODEV;
++	}
++	utils::scope_exit vShaderGuard([&] { glDeleteShader(tdnVertexShaderId_); });
++
++	if (egl_.compileFragmentShader(tdnFragmentShaderId_, temporal_denoise_frag,
++				       shaderEnv)) {
++		LOG(Debayer, Error) << "Compile temporal denoise fragment shader fail";
++		return -ENODEV;
++	}
++	utils::scope_exit fShaderGuard([&] { glDeleteShader(tdnFragmentShaderId_); });
++
++	if (egl_.linkProgram(tdnProgramId_, tdnVertexShaderId_, tdnFragmentShaderId_)) {
++		LOG(Debayer, Error) << "Linking temporal denoise program fail";
++		return -ENODEV;
++	}
++
++	egl_.useProgram(tdnProgramId_);
++
++	tdnAttributeVertex_ = glGetAttribLocation(tdnProgramId_, "vertexIn");
++	tdnAttributeTexture_ = glGetAttribLocation(tdnProgramId_, "textureIn");
++	tdnUniformProjMatrix_ = glGetUniformLocation(tdnProgramId_, "proj_matrix");
++	tdnUniformStrideFactor_ = glGetUniformLocation(tdnProgramId_, "stride_factor");
++	tdnUniformScene_ = glGetUniformLocation(tdnProgramId_, "tex_scene");
++	tdnUniformHistory_ = glGetUniformLocation(tdnProgramId_, "tex_history");
++	tdnUniformStep_ = glGetUniformLocation(tdnProgramId_, "tex_step");
++	tdnUniformAlphaMin_ = glGetUniformLocation(tdnProgramId_, "alphaMin");
++	tdnUniformMotionLo_ = glGetUniformLocation(tdnProgramId_, "motionLo");
++	tdnUniformMotionHi_ = glGetUniformLocation(tdnProgramId_, "motionHi");
++	tdnUniformChromaSigma_ = glGetUniformLocation(tdnProgramId_, "chromaSigma");
++	tdnUniformMotion_ = glGetUniformLocation(tdnProgramId_, "tex_motion");
++	tdnUniformMotionRange_ = glGetUniformLocation(tdnProgramId_, "motionBias");
++	tdnUniformUseMotion_ = glGetUniformLocation(tdnProgramId_, "useMotion");
++	tdnUniformClampSigmas_ = glGetUniformLocation(tdnProgramId_, "clampSigmas");
++	tdnUniformClampFloor_ = glGetUniformLocation(tdnProgramId_, "clampFloor");
++
++	LOG(Debayer, Info) << "Temporal denoise enabled, alphaMin " << tdnAlphaMin_
++			   << " motion thresholds " << tdnMotionLo_ << "/"
++			   << tdnMotionHi_ << ", residual noise "
++			   << tdnNoiseResidual_ << ", chroma sigma "
++			   << tdnChromaSigma_ << " noise sigmas";
++
++	return 0;
++}
++
++/**
++ * \brief Allocate the scene and history textures for the temporal denoise pass
++ *
++ * Both are the size of the output stream. They are allocated on first use
++ * rather than in start() because they need a current EGL context.
++ *
++ * \return 0 on success, or a negative error code otherwise
++ */
++int DebayerEGL::allocateTemporalDenoiseImages()
++{
++	std::unique_ptr<eGLImage> *images[] = { &sceneImage_, &historyImage_[0],
++					       &historyImage_[1] };
++	GLenum units[] = { GL_TEXTURE2, GL_TEXTURE3, GL_TEXTURE4 };
++	unsigned int i = 0;
++
++	for (auto *image : images) {
++		*image = std::make_unique<eGLImage>(GL_RGBA, workSize_.width,
++						   workSize_.height,
++						   workSize_.width * 4,
++						   units[i], 2 + i);
++		egl_.createOutputTexture2D(**image);
++
++		/*
++		 * Linear filtering, unlike everything else here, because the
++		 * denoise shader deliberately samples between texels to get a
++		 * 2x2 average out of a single fetch.
++		 */
++		egl_.activateBindTexture(**image);
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++
++		/* Start from a defined state rather than whatever VRAM held. */
++		egl_.attachTextureToFBO(**image);
++		glClear(GL_COLOR_BUFFER_BIT);
++		i++;
++	}
++
++	GLenum err = glGetError();
++	if (err != GL_NO_ERROR) {
++		LOG(Debayer, Error) << "Temporal denoise texture setup failed " << err;
++		sceneImage_.reset();
++		historyImage_[0].reset();
++		historyImage_[1].reset();
++		return -ENODEV;
++	}
++
++	if (motionEnabled_ && allocateMotionImages())
++		motionEnabled_ = false;
++
++	tdnHistoryValid_ = false;
++
++	return 0;
++}
++
++/**
++ * \brief Blend the debayered scene against the previous output frame
++ * \param[in] eglImageOut Destination, the caller's output buffer
++ * \param[in] params Debayer parameters for this frame
++ *
++ * Runs after the debayer pass has left this frame in sceneImage_.
++ */
++void DebayerEGL::runTemporalDenoise(const DebayerParams &params)
++{
++	static const GLfloat vcoordinates[4][2] = {
++		{ -1.0f, -1.0f },
++		{ -1.0f, +1.0f },
++		{ +1.0f, +1.0f },
++		{ +1.0f, -1.0f },
++	};
++	static const GLfloat tcoordinates[4][2] = {
++		{ 0.0f, 0.0f },
++		{ 0.0f, 1.0f },
++		{ 1.0f, 1.0f },
++		{ 1.0f, 0.0f },
++	};
++	static const GLfloat identityMatrix[] = {
++		1.0f, 0.0f, 0.0f, 0.0f,
++		0.0f, 1.0f, 0.0f, 0.0f,
++		0.0f, 0.0f, 1.0f, 0.0f,
++		0.0f, 0.0f, 0.0f, 1.0f,
++	};
++	GLfloat step[] = { 1.0f / workSize_.width, 1.0f / workSize_.height };
++
++	egl_.useProgram(tdnProgramId_);
++
++	glEnableVertexAttribArray(tdnAttributeVertex_);
++	glVertexAttribPointer(tdnAttributeVertex_, 2, GL_FLOAT, GL_TRUE,
++			      2 * sizeof(GLfloat), vcoordinates);
++	glEnableVertexAttribArray(tdnAttributeTexture_);
++	glVertexAttribPointer(tdnAttributeTexture_, 2, GL_FLOAT, GL_TRUE,
++			      2 * sizeof(GLfloat), tcoordinates);
++
++	glUniformMatrix4fv(tdnUniformProjMatrix_, 1, GL_FALSE, identityMatrix);
++	glUniform1f(tdnUniformStrideFactor_, 1.0f);
++	glUniform2fv(tdnUniformStep_, 1, step);
++
++	eGLImage &historyRead = *historyImage_[historyIndex_];
++
++	/*
++	 * Find where everything moved before blending, so the blend can fetch
++	 * the history from there. Skipped on the first frame, when there is no
++	 * history to search.
++	 */
++	bool useMotion = motionEnabled_ && tdnHistoryValid_;
++
++	if (useMotion)
++		runMotionSearch();
++
++	egl_.useProgram(tdnProgramId_);
++
++	egl_.activateBindTexture(*sceneImage_);
++	egl_.activateBindTexture(historyRead);
++	glUniform1i(tdnUniformScene_, sceneImage_->texture_unit_uniform_id_);
++	glUniform1i(tdnUniformHistory_, historyRead.texture_unit_uniform_id_);
++
++	/*
++	 * Noise power tracks gain, because the AGC holds the output level
++	 * steady and so gain reports how little light the scene gave. Both
++	 * motion thresholds are therefore expressed per unit of gain: they
++	 * have to sit above the noise floor to tell motion from it, and that
++	 * floor moves with every scene.
++	 */
++	float gain = std::max(params.analogueGain, 1.0f);
++	/*
++	 * Fade the filter out in good light. There it removes noise nobody
++	 * would have seen, while still carrying the risk of smearing slow,
++	 * low contrast motion, so the trade stops being worth making.
++	 */
++	float strength = denoiseStrength(gain);
++	/* denoiseStrength() already returns zero before there is a history. */
++	float alphaMin = 1.0f - strength * (1.0f - tdnAlphaMin_);
++
++	glUniform1f(tdnUniformAlphaMin_, alphaMin);
++	/* The thresholds sit on a squared statistic, so they follow noise squared. */
++	float energyScale = gain / kNoiseRefGain;
++
++	glUniform1f(tdnUniformMotionLo_, tdnMotionLo_ * energyScale);
++	glUniform1f(tdnUniformMotionHi_, tdnMotionHi_ * energyScale);
++
++	glUniform1f(tdnUniformChromaSigma_,
++		    strength > 0.0f ? tdnChromaSigma_ * noiseEstimate(gain) : 0.0f);
++
++	if (useMotion) {
++		eGLImage &field = *motion_[0].mv;
++
++		egl_.activateBindTexture(field);
++		glUniform1i(tdnUniformMotion_, field.texture_unit_uniform_id_);
++	}
++
++	glUniform1f(tdnUniformMotionRange_, kMotionBias);
++	glUniform1f(tdnUniformUseMotion_, useMotion ? 1.0f : 0.0f);
++	glUniform1f(tdnUniformClampSigmas_, tdnClampSigmas_);
++	/* A tap is a 2x2 mean, so it carries half a pixel's deviation. */
++	glUniform1f(tdnUniformClampFloor_, noiseEstimate(gain) / 2.0f / 255.0f);
++
++	egl_.attachTextureToFBO(*historyImage_[1 - historyIndex_]);
++	glViewport(0, 0, workSize_.width, workSize_.height);
++	glDrawArrays(GL_TRIANGLE_FAN, 0, DEBAYER_OPENGL_COORDS);
++
++	tdnHistoryValid_ = true;
++}
++
++/**
++ * \brief Estimate the noise the later passes have to work around
++ * \param[in] gain Analogue gain the sensor is running at
++ *
++ * Returns the standard deviation, in 8-bit units, of what is left after the
++ * temporal filter - or of the incoming frame when that filter is not running.
++ * Both the chroma weights and the sharpening threshold are expressed as
++ * multiples of this, because both are answering the same question: is this
++ * difference a real feature or is it noise?
++ *
++ * \return The estimated noise standard deviation in 8-bit units
++ */
++float DebayerEGL::denoiseStrength(float gain) const
++{
++	if (!tdnEnabled_ || !tdnHistoryValid_)
++		return 0.0f;
++
++	return std::clamp((gain - kTdnGainOff) / (kTdnGainFull - kTdnGainOff),
++			  0.0f, 1.0f);
++}
++
++float DebayerEGL::noiseScale(float gain) const
++{
++	/*
++	 * Noise relative to the reference gain. The AGC holds the output
++	 * level steady, so gain measures how few photons the scene gave, and
++	 * shot noise goes as their square root.
++	 *
++	 * Measuring this is easy to get wrong. Noise also depends strongly on
++	 * how bright the pixel is - gamma stretches the dark end, so the same
++	 * frame runs from about 28 in the shadows to 19 near white. Comparing
++	 * two scenes without holding brightness fixed says whatever the two
++	 * happened to be lit like; done that way these numbers looked flat in
++	 * gain. Held at a fixed brightness across 108x, 137x and 248x the
++	 * exponent comes out at 0.51 to 0.60, and the square root stands.
++	 */
++	return std::sqrt(gain / kNoiseRefGain);
++}
++
++float DebayerEGL::noiseEstimate(float gain) const
++{
++	float noise = tdnNoiseResidual_ * noiseScale(gain);
++
++	/*
++	 * That figure is what the temporal filter leaves behind. In good
++	 * light the filter is faded out, so the frame still carries its full
++	 * noise - interpolate back up by however much of the filter is
++	 * actually running. Getting this backwards would set the sharpening
++	 * threshold four times too low exactly where the filter has stopped
++	 * protecting it.
++	 */
++	float attenuation = std::sqrt(tdnAlphaMin_ / (2.0f - tdnAlphaMin_));
++	float strength = denoiseStrength(gain);
++
++	return noise / (strength + (1.0f - strength) * attenuation);
++}
++
++/**
++ * \brief Compile and link the sharpening pass
++ * \return 0 on success, or a negative error code otherwise
++ */
++int DebayerEGL::initSharpen()
++{
++	std::vector<std::string> shaderEnv;
++	const char *env;
++
++	env = utils::secure_getenv("LIBCAMERA_TDN_SHARPEN");
++	if (env)
++		sharpenAmount_ = atof(env);
++	env = utils::secure_getenv("LIBCAMERA_TDN_SHARPEN_CORE");
++	if (env)
++		sharpenCore_ = atof(env);
++
++	if (sharpenAmount_ <= 0.0f) {
++		sharpenEnabled_ = false;
++		LOG(Debayer, Info) << "Sharpening disabled, output pass still reduces";
++	}
++
++	egl_.pushEnv(shaderEnv, "#version 100");
++
++	if (egl_.compileVertexShader(sharpenVertexShaderId_, identity_vert, shaderEnv)) {
++		LOG(Debayer, Error) << "Compile sharpen vertex shader fail";
++		return -ENODEV;
++	}
++	utils::scope_exit vShaderGuard([&] { glDeleteShader(sharpenVertexShaderId_); });
++
++	if (egl_.compileFragmentShader(sharpenFragmentShaderId_, sharpen_frag, shaderEnv)) {
++		LOG(Debayer, Error) << "Compile sharpen fragment shader fail";
++		return -ENODEV;
++	}
++	utils::scope_exit fShaderGuard([&] { glDeleteShader(sharpenFragmentShaderId_); });
++
++	if (egl_.linkProgram(sharpenProgramId_, sharpenVertexShaderId_,
++			     sharpenFragmentShaderId_)) {
++		LOG(Debayer, Error) << "Linking sharpen program fail";
++		return -ENODEV;
++	}
++
++	egl_.useProgram(sharpenProgramId_);
++
++	sharpenAttributeVertex_ = glGetAttribLocation(sharpenProgramId_, "vertexIn");
++	sharpenAttributeTexture_ = glGetAttribLocation(sharpenProgramId_, "textureIn");
++	sharpenUniformProjMatrix_ = glGetUniformLocation(sharpenProgramId_, "proj_matrix");
++	sharpenUniformStrideFactor_ = glGetUniformLocation(sharpenProgramId_, "stride_factor");
++	sharpenUniformSource_ = glGetUniformLocation(sharpenProgramId_, "tex_source");
++	sharpenUniformSrcSpan_ = glGetUniformLocation(sharpenProgramId_, "srcSpan");
++	sharpenUniformSrcOffset_ = glGetUniformLocation(sharpenProgramId_, "srcOffset");
++	sharpenUniformSrcPixel_ = glGetUniformLocation(sharpenProgramId_, "srcPixel");
++	sharpenUniformBoxOffset_ = glGetUniformLocation(sharpenProgramId_, "boxOffset");
++	sharpenUniformAmount_ = glGetUniformLocation(sharpenProgramId_, "sharpenAmount");
++	sharpenUniformCore_ = glGetUniformLocation(sharpenProgramId_, "sharpenCore");
++
++	LOG(Debayer, Info) << "Sharpening enabled, amount " << sharpenAmount_
++			   << " core " << sharpenCore_ << " noise sigmas";
++
++	return 0;
++}
++
++/**
++ * \brief Sharpen the blended frame in place
++ * \param[in] eglImageOut Destination, the caller's output buffer
++ * \param[in] params Debayer parameters for this frame
++ *
++ * Reads historyImage_, which at this point already holds the un-sharpened
++ * blend for this frame, and writes the sharpened result over the output.
++ */
++void DebayerEGL::runSharpen(eGLImage &eglImageOut, const DebayerParams &params)
++{
++	static const GLfloat vcoordinates[4][2] = {
++		{ -1.0f, -1.0f }, { -1.0f, +1.0f }, { +1.0f, +1.0f }, { +1.0f, -1.0f },
++	};
++	static const GLfloat tcoordinates[4][2] = {
++		{ 0.0f, 0.0f }, { 0.0f, 1.0f }, { 1.0f, 1.0f }, { 1.0f, 0.0f },
++	};
++	static const GLfloat identityMatrix[] = {
++		1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f,
++		0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f,
++	};
++	float gain = std::max(params.analogueGain, 1.0f);
++
++	/*
++	 * The internal passes rendered the whole native frame; this one picks
++	 * out the region the caller asked for and reduces it, centred.
++	 */
++	float scale = std::max((float)outputSize_.width / nativeOutputSize_.width,
++			       (float)outputSize_.height / nativeOutputSize_.height);
++	GLfloat srcSpan[] = { outputSize_.width / (scale * workSize_.width),
++			      outputSize_.height / (scale * workSize_.height) };
++	GLfloat srcPixel[] = { srcSpan[0] / outputSize_.width,
++			       srcSpan[1] / outputSize_.height };
++	GLfloat srcOffset[] = { (1.0f - srcSpan[0]) / 2.0f,
++				(1.0f - srcSpan[1]) / 2.0f };
++
++	/*
++	 * Source pixels per output pixel. Below about one there is nothing to
++	 * reduce, and the four fetches must land on the same point so that
++	 * asking for the native size returns the native image untouched.
++	 */
++	float box = 1.0f / scale;
++	GLfloat boxOffset[] = { 0.0f, 0.0f };
++
++	if (box > 1.05f) {
++		boxOffset[0] = (box / 4.0f) / workSize_.width;
++		boxOffset[1] = (box / 4.0f) / workSize_.height;
++	}
++
++	egl_.useProgram(sharpenProgramId_);
++
++	glEnableVertexAttribArray(sharpenAttributeVertex_);
++	glVertexAttribPointer(sharpenAttributeVertex_, 2, GL_FLOAT, GL_TRUE,
++			      2 * sizeof(GLfloat), vcoordinates);
++	glEnableVertexAttribArray(sharpenAttributeTexture_);
++	glVertexAttribPointer(sharpenAttributeTexture_, 2, GL_FLOAT, GL_TRUE,
++			      2 * sizeof(GLfloat), tcoordinates);
++
++	glUniformMatrix4fv(sharpenUniformProjMatrix_, 1, GL_FALSE, identityMatrix);
++	glUniform1f(sharpenUniformStrideFactor_, 1.0f);
++	glUniform2fv(sharpenUniformSrcSpan_, 1, srcSpan);
++	glUniform2fv(sharpenUniformSrcOffset_, 1, srcOffset);
++	glUniform2fv(sharpenUniformSrcPixel_, 1, srcPixel);
++	glUniform2fv(sharpenUniformBoxOffset_, 1, boxOffset);
++
++	eGLImage &source = *historyImage_[1 - historyIndex_];
++
++	egl_.activateBindTexture(source);
++	glUniform1i(sharpenUniformSource_, source.texture_unit_uniform_id_);
++
++	/*
++	 * The threshold has to sit above the noise or the pass just amplifies
++	 * it. Measured at 248x gain: 2.6 noise standard deviations buys a
++	 * third off the edge width for four percent more noise.
++	 */
++	glUniform1f(sharpenUniformAmount_, sharpenEnabled_ ? sharpenAmount_ : 0.0f);
++	glUniform1f(sharpenUniformCore_, sharpenCore_ * noiseEstimate(gain));
++
++	egl_.attachTextureToFBO(eglImageOut);
++	glViewport(0, 0, outputSize_.width, outputSize_.height);
++	glDrawArrays(GL_TRIANGLE_FAN, 0, DEBAYER_OPENGL_COORDS);
++
++	/* What was written this frame becomes what is read the next. */
++	historyIndex_ = 1 - historyIndex_;
++}
++
+ int DebayerEGL::debayerGPU(FrameBuffer *input, FrameBuffer *output, const DebayerParams &params, std::optional<MappedFrameBuffer> *inMapped, std::optional<DmaSyncer> *inDmaSyncer)
+ {
+ 	eGLImage *eglImageIn;
+@@ -604,13 +1385,35 @@ int DebayerEGL::debayerGPU(FrameBuffer *input, FrameBuffer *output, const Debaye
+ 	if (!eglImageOut)
+ 		return -ENOMEM;
+ 
+-	egl_.attachTextureToFBO(*eglImageOut);
++	if (tdnEnabled_ && !sceneImage_ && allocateTemporalDenoiseImages())
++		tdnEnabled_ = false;
++
++	/*
++	 * With denoise on, the debayer renders into our own scene texture and
++	 * the second pass writes the caller's buffer. The viewport and the
++	 * projection stay as they are either way, so the debayer pass cannot
++	 * tell the difference.
++	 */
++	egl_.useProgram(programId_);
++	egl_.attachTextureToFBO(tdnEnabled_ ? *sceneImage_ : *eglImageOut);
+ 	setShaderVariableValues(*eglImageIn, params);
+ 
+ 	glViewport(0, 0, width_, height_);
+ 	glClear(GL_COLOR_BUFFER_BIT);
+ 	glDrawArrays(GL_TRIANGLE_FAN, 0, DEBAYER_OPENGL_COORDS);
+ 
++	if (tdnEnabled_) {
++		runTemporalDenoise(params);
++
++		/*
++		 * The output pass reduces the freshly blended frame to the
++		 * size the caller asked for and sharpens it on the way. It is
++		 * not optional: the internal passes run at the native size, so
++		 * this is what puts anything into the caller's buffer at all.
++		 */
++		runSharpen(*eglImageOut, params);
++	}
++
+ 	GLenum err = glGetError();
+ 	if (err != GL_NO_ERROR) {
+ 		LOG(eGL, Error) << "Drawing scene fail " << err;
+@@ -635,6 +1438,13 @@ void DebayerEGL::process(uint32_t frame, FrameBuffer *input, FrameBuffer *output
+ 	std::optional<MappedFrameBuffer> inMapped;
+ 	std::optional<DmaSyncer> inDmaSyncer;
+ 
++	/*
++	 * The statistics need this frame's gains to tell which pixels already
++	 * look neutral. They cannot come from the IPA later: by then the sums
++	 * are taken, and a sum cannot be un-mixed.
++	 */
++	stats_->setNeutralReference(params.gains, params.blackLevel);
++
+ 	if (debayerGPU(input, output, params, &inMapped, &inDmaSyncer)) {
+ 		LOG(Debayer, Error) << "debayerGPU failed";
+ 		goto error;
+@@ -688,6 +1498,17 @@ int DebayerEGL::start()
+ 	if (initBayerShaders(inputPixelFormat_, outputPixelFormat_))
+ 		return -EINVAL;
+ 
++	if (initTemporalDenoise())
++		tdnEnabled_ = false;
++
++	if (initMotionSearch())
++		motionEnabled_ = false;
++
++	if (initSharpen()) {
++		LOG(Debayer, Error) << "Output pass failed to build, disabling denoise";
++		tdnEnabled_ = false;
++	}
++
+ 	return 0;
+ }
+ 
+@@ -695,9 +1516,40 @@ void DebayerEGL::stop()
+ {
+ 	eglImageOutCache_.clear();
+ 	eglImageInCache_.clear();
++	sceneImage_.reset();
++	historyImage_[0].reset();
++	historyImage_[1].reset();
++	historyIndex_ = 0;
++	tdnHistoryValid_ = false;
+ 
+ 	if (programId_)
+ 		glDeleteProgram(programId_);
++
++	if (tdnProgramId_) {
++		glDeleteProgram(tdnProgramId_);
++		tdnProgramId_ = 0;
++	}
++
++	for (unsigned int i = 0; i < kMotionLevels; i++) {
++		motion_[i].sceneLuma.reset();
++		motion_[i].histLuma.reset();
++		motion_[i].mv.reset();
++	}
++
++	if (pyramidProgramId_) {
++		glDeleteProgram(pyramidProgramId_);
++		pyramidProgramId_ = 0;
++	}
++
++	if (motionProgramId_) {
++		glDeleteProgram(motionProgramId_);
++		motionProgramId_ = 0;
++	}
++
++	if (sharpenProgramId_) {
++		glDeleteProgram(sharpenProgramId_);
++		sharpenProgramId_ = 0;
++	}
+ }
+ 
+ SizeRange DebayerEGL::sizes(PixelFormat inputFormat, const Size &inputSize)
+diff --git i/src/libcamera/software_isp/debayer_egl.h w/src/libcamera/software_isp/debayer_egl.h
+index d6223f3a9..bc3fb6003 100644
+--- i/src/libcamera/software_isp/debayer_egl.h
++++ w/src/libcamera/software_isp/debayer_egl.h
+@@ -68,6 +68,19 @@ private:
+ 	int getShaderVariableLocations();
+ 	void setShaderVariableValues(eGLImage &eGLImageIn, const DebayerParams &params);
+ 	int debayerGPU(FrameBuffer *input, FrameBuffer *output, const DebayerParams &params, std::optional<MappedFrameBuffer> *mappedInputBuffer, std::optional<DmaSyncer> *inputBufferDmaSyncer);
++	int initTemporalDenoise();
++	int allocateTemporalDenoiseImages();
++	int initMotionSearch();
++	int allocateMotionImages();
++	void runMotionSearch();
++	void drawQuad(GLint vertexAttr, GLint textureAttr, GLint projUniform,
++		      GLint strideUniform, const Size &viewport);
++	void runTemporalDenoise(const DebayerParams &params);
++	int initSharpen();
++	void runSharpen(eGLImage &eglImageOut, const DebayerParams &params);
++	float denoiseStrength(float gain) const;
++	float noiseEstimate(float gain) const;
++	float noiseScale(float gain) const;
+ 
+ 	eGLImage *getCachedInputFrameBuffer(FrameBuffer *input, std::optional<MappedFrameBuffer> *inMapped, std::optional<DmaSyncer> *inDmaSyncer);
+ 	eGLImage *getCachedOutputFrameBuffer(FrameBuffer *output);
+@@ -107,10 +120,139 @@ private:
+ 
+ 	/* Gamma */
+ 	GLint gammaUniformDataIn_;
++	GLint lensCentreUniform_;
++	GLint lensAspectUniform_;
++	GLint lensAUniform_;
++	GLint lensBUniform_;
++	GLint lensColourUniform_;
++	GLint lensLumaUniform_;
++	GLint toneLiftUniformDataIn_;
++	GLint toneContrastUniformDataIn_;
++	GLint toneTargetUniformDataIn_;
+ 
+ 	/* Contrast */
+ 	GLint contrastExpUniformDataIn_;
+ 
++	/*
++	 * Temporal denoise. The debayer pass renders into sceneImage_ instead
++	 * of straight into the caller's buffer, and a second pass blends that
++	 * against historyImage_ - the frame emitted last time - on its way
++	 * out. Both are ours rather than taken from the output pool, so the
++	 * history cannot be pulled out from under us when buffers rotate.
++	 */
++	GLuint tdnVertexShaderId_ = 0;
++	GLuint tdnFragmentShaderId_ = 0;
++	GLuint tdnProgramId_ = 0;
++	GLint tdnAttributeVertex_;
++	GLint tdnAttributeTexture_;
++	GLint tdnUniformProjMatrix_;
++	GLint tdnUniformStrideFactor_;
++	GLint tdnUniformScene_;
++	GLint tdnUniformHistory_;
++	GLint tdnUniformStep_;
++	GLint tdnUniformAlphaMin_;
++	GLint tdnUniformMotionLo_;
++	GLint tdnUniformMotionHi_;
++	GLint tdnUniformChromaSigma_;
++	GLint tdnUniformMotion_;
++	GLint tdnUniformMotionRange_;
++	GLint tdnUniformUseMotion_;
++	GLint tdnUniformClampSigmas_;
++	GLint tdnUniformClampFloor_;
++	std::unique_ptr<eGLImage> sceneImage_;
++	/*
++	 * Two history buffers, used alternately: the blend reads one and
++	 * writes the other, because a pass cannot read and write the same
++	 * texture. The sharpening pass then reads whichever was just written.
++	 */
++	std::unique_ptr<eGLImage> historyImage_[2];
++	unsigned int historyIndex_ = 0;
++	bool tdnEnabled_ = true;
++	bool tdnHistoryValid_ = false;
++	float tdnAlphaMin_ = 0.12f;
++	/*
++	 * Coarse-to-fine motion search. Level 0 is half the working
++	 * resolution, each further level halves again. Each level keeps the
++	 * luma of both frames and the displacement found at that scale.
++	 */
++	static constexpr unsigned int kMotionLevels = 3;
++
++	struct MotionLevel {
++		std::unique_ptr<eGLImage> sceneLuma;
++		std::unique_ptr<eGLImage> histLuma;
++		std::unique_ptr<eGLImage> mv;
++		Size size;
++	};
++
++	MotionLevel motion_[kMotionLevels];
++
++	GLuint pyramidProgramId_ = 0;
++	GLint pyramidAttributeVertex_;
++	GLint pyramidAttributeTexture_;
++	GLint pyramidUniformProjMatrix_;
++	GLint pyramidUniformStrideFactor_;
++	GLint pyramidUniformSource_;
++	GLint pyramidUniformIsColour_;
++
++	GLuint motionProgramId_ = 0;
++	GLint motionAttributeVertex_;
++	GLint motionAttributeTexture_;
++	GLint motionUniformProjMatrix_;
++	GLint motionUniformStrideFactor_;
++	GLint motionUniformCurrent_;
++	GLint motionUniformHistory_;
++	GLint motionUniformPrior_;
++	GLint motionUniformStep_;
++	GLint motionUniformHasPrior_;
++	GLint motionUniformRadius_;
++	GLint motionUniformRange_;
++
++	bool motionEnabled_ = true;
++
++	/* Pooled squared difference, quoted at the reference gain. */
++	float tdnMotionLo_ = 387.0f;
++	float tdnMotionHi_ = 2319.0f;
++	/*
++	 * Residual noise the temporal filter leaves at the reference gain,
++	 * in 8-bit units. Both scale as the square root of gain; see
++	 * noiseScale() for how that was measured and how it is easy to
++	 * measure wrongly.
++	 */
++	float tdnNoiseResidual_ = 6.3f;
++	/* Chroma taps and sharpening thresholds, both in units of that noise. */
++	float tdnChromaSigma_ = 2.6f;
++	float tdnClampSigmas_ = 3.0f;
++
++	/*
++	 * Sharpening runs as a third pass, reading back the un-sharpened
++	 * blend that was just kept as history. Keeping it out of the temporal
++	 * loop is what stops it compounding frame after frame.
++	 */
++	GLuint sharpenVertexShaderId_ = 0;
++	GLuint sharpenFragmentShaderId_ = 0;
++	GLuint sharpenProgramId_ = 0;
++	GLint sharpenAttributeVertex_;
++	GLint sharpenAttributeTexture_;
++	GLint sharpenUniformProjMatrix_;
++	GLint sharpenUniformStrideFactor_;
++	GLint sharpenUniformSource_;
++	GLint sharpenUniformSrcPixel_;
++	GLint sharpenUniformBoxOffset_;
++	GLint sharpenUniformAmount_;
++	GLint sharpenUniformCore_;
++	GLint sharpenUniformSrcSpan_;
++	GLint sharpenUniformSrcOffset_;
++	bool sharpenEnabled_ = true;
++	float sharpenAmount_ = 1.2f;
++	float sharpenCore_ = 2.6f;
++
++	/*
++	 * Resolution the internal passes run at. Kept at the sensor's native
++	 * output even when the caller asks for less, so that the reduction to
++	 * the requested size can be done by averaging whole blocks of pixels
++	 * rather than by throwing all but one of them away.
++	 */
++	Size workSize_;
+ 	Size nativeOutputSize_;
+ 	Rectangle window_;
+ 	std::unique_ptr<SwStatsCpu> stats_;
+diff --git i/src/libcamera/software_isp/swstats_cpu.cpp w/src/libcamera/software_isp/swstats_cpu.cpp
+index 7fb77ce7d..540fd0c15 100644
+--- i/src/libcamera/software_isp/swstats_cpu.cpp
++++ w/src/libcamera/software_isp/swstats_cpu.cpp
+@@ -11,6 +11,8 @@
+ 
+ #include "libcamera/internal/software_isp/swstats_cpu.h"
+ 
++#include <cmath>
++
+ #include <libcamera/base/log.h>
+ 
+ #include <libcamera/stream.h>
+@@ -171,28 +173,95 @@ static constexpr unsigned int kRedYMul = 77; /* 0.299 * 256 */
+ static constexpr unsigned int kGreenYMul = 150; /* 0.587 * 256 */
+ static constexpr unsigned int kBlueYMul = 29; /* 0.114 * 256 */
+ 
++/*
++ * Pixels at or above this fraction of full scale are treated as saturated and
++ * kept out of the colour sums. A saturated pixel reads the same in every
++ * channel no matter what colour it was, so it carries no white balance
++ * information - but it is also the brightest kind of pixel there is, so it
++ * carries a lot of weight. A scene with a blown out window or wall can put a
++ * third of the total sum into pixels that say nothing, dragging the grey
++ * world estimate towards neutral and leaving a visible cast behind.
++ */
++static constexpr unsigned int kSaturationThreshold = 248;
++
++/*
++ * How far a pixel may sit from neutral, as a fraction of its own level, and
++ * still be counted as evidence of what neutral looks like. Loose enough that
++ * a typical scene keeps most of its pixels - measured at around 60% - because
++ * an estimator that throws away almost everything is one bad frame away from
++ * having nothing to estimate from.
++ */
++static constexpr float kNeutralTolerance = 0.20f;
++
++/* Below this level above black the channel ratios are mostly noise. */
++static constexpr float kNeutralMinLevel = 8.0f;
++
+ #define SWSTATS_START_LINE_STATS(pixel_t) \
+ 	pixel_t r, g, g2, b;              \
+ 	uint64_t yVal;                    \
+                                           \
+ 	uint64_t sumR = 0;                \
+ 	uint64_t sumG = 0;                \
+-	uint64_t sumB = 0;
++	uint64_t sumB = 0;                \
++	uint64_t nSamples = 0;            \
++	uint64_t sumNR = 0;               \
++	uint64_t sumNG = 0;               \
++	uint64_t sumNB = 0;               \
++	uint64_t nNeutral = 0;
+ 
+-#define SWSTATS_ACCUMULATE_LINE_STATS(div) \
+-	sumR += r;                         \
+-	sumG += g;                         \
+-	sumB += b;                         \
+-                                           \
+-	yVal = r * kRedYMul;               \
+-	yVal += g * kGreenYMul;            \
+-	yVal += b * kBlueYMul;             \
++#define SWSTATS_ACCUMULATE_LINE_STATS(div)                     \
++	if (r < kSaturationThreshold * (div) &&                \
++	    g < kSaturationThreshold * (div) &&                \
++	    b < kSaturationThreshold * (div)) {                \
++		sumR += r;                                     \
++		sumG += g;                                     \
++		sumB += b;                                     \
++		nSamples++;                                    \
++		SWSTATS_ACCUMULATE_NEUTRAL(div)                \
++	}                                                      \
++                                                               \
++	yVal = r * kRedYMul;                                   \
++	yVal += g * kGreenYMul;                                \
++	yVal += b * kBlueYMul;                                 \
+ 	stats.yHistogram[yVal * SwIspStats::kYHistogramSize / (256 * 256 * (div))]++;
+ 
+-#define SWSTATS_FINISH_LINE_STATS() \
+-	stats.sum_.r() += sumR;     \
+-	stats.sum_.g() += sumG;     \
+-	stats.sum_.b() += sumB;
++/*
++ * Apply the gains the IPA settled on last frame and ask whether what comes out
++ * is neutral. Doing it here rather than in the IPA is what makes it possible
++ * at all: by the time the IPA sees the statistics they are already summed, and
++ * a sum cannot be un-mixed. One frame of lag on the gains costs nothing - the
++ * estimator is iterative by nature, and the iteration simply runs across
++ * frames instead of within one.
++ */
++#define SWSTATS_ACCUMULATE_NEUTRAL(div)                                     \
++	{                                                                   \
++		float black = neutralBlack_ * (div);                        \
++		float nr = (r - black) * neutralGains_[0];                  \
++		float ng = (g - black) * neutralGains_[1];                  \
++		float nb = (b - black) * neutralGains_[2];                  \
++		float mean = (nr + ng + nb) / 3.0f;                         \
++		float tol = kNeutralTolerance * mean;                       \
++                                                                            \
++		if (mean > kNeutralMinLevel * (div) &&                      \
++		    std::abs(nr - mean) < tol &&                            \
++		    std::abs(ng - mean) < tol &&                            \
++		    std::abs(nb - mean) < tol) {                            \
++			sumNR += r;                                         \
++			sumNG += g;                                         \
++			sumNB += b;                                         \
++			nNeutral++;                                         \
++		}                                                           \
++	}
++
++#define SWSTATS_FINISH_LINE_STATS()        \
++	stats.sum_.r() += sumR;            \
++	stats.sum_.g() += sumG;            \
++	stats.sum_.b() += sumB;            \
++	stats.sumSamples_ += nSamples;     \
++	stats.sumNeutral_.r() += sumNR;    \
++	stats.sumNeutral_.g() += sumNG;    \
++	stats.sumNeutral_.b() += sumNB;    \
++	stats.sumNeutralSamples_ += nNeutral;
+ 
+ void SwStatsCpu::statsBGGR8Line0(const uint8_t *src[], SwIspStats &stats)
+ {
+@@ -375,6 +444,23 @@ void SwStatsCpu::statsGBRG12PLine0(const uint8_t *src[], SwIspStats &stats)
+ 	SWSTATS_FINISH_LINE_STATS()
+ }
+ 
++/**
++ * \brief Set what the neutral-pixel test measures against
++ * \param[in] gains Colour gains the IPA is currently applying
++ * \param[in] blackLevel Black level, normalised to [0,1]
++ *
++ * Called once per frame before the statistics are gathered.
++ */
++void SwStatsCpu::setNeutralReference(const RGB<float> &gains,
++				     const RGB<float> &blackLevel)
++{
++	for (unsigned int i = 0; i < 3; i++)
++		neutralGains_[i] = gains[i];
++
++	/* The line statistics work on an 8-bit scale times the format divisor. */
++	neutralBlack_ = blackLevel[1] * 255.0f;
++}
++
+ /**
+  * \brief Reset state to start statistics gathering for a new frame
+  * \param[in] frame The frame number
+@@ -391,6 +477,9 @@ void SwStatsCpu::startFrame(uint32_t frame)
+ 
+ 	for (auto &s : stats_) {
+ 		s.sum_ = RGB<uint64_t>({ 0, 0, 0 });
++		s.sumSamples_ = 0;
++		s.sumNeutral_ = RGB<uint64_t>({ 0, 0, 0 });
++		s.sumNeutralSamples_ = 0;
+ 		s.yHistogram.fill(0);
+ 	}
+ }
+@@ -408,14 +497,26 @@ void SwStatsCpu::finishFrame(uint32_t frame, uint32_t bufferId)
+ 
+ 	if (valid) {
+ 		sharedStats_->sum_ = RGB<uint64_t>({ 0, 0, 0 });
++		sharedStats_->sumSamples_ = 0;
++		sharedStats_->sumNeutral_ = RGB<uint64_t>({ 0, 0, 0 });
++		sharedStats_->sumNeutralSamples_ = 0;
+ 		sharedStats_->yHistogram.fill(0);
+ 		for (const auto &s : stats_) {
+ 			sharedStats_->sum_ += s.sum_;
++			sharedStats_->sumSamples_ += s.sumSamples_;
++			sharedStats_->sumNeutral_ += s.sumNeutral_;
++			sharedStats_->sumNeutralSamples_ += s.sumNeutralSamples_;
+ 			for (unsigned int j = 0; j < SwIspStats::kYHistogramSize; j++)
+ 				sharedStats_->yHistogram[j] += s.yHistogram[j];
+ 		}
+ 
++		/*
++		 * Bring the sums down to an 8-bit scale. The sample count is
++		 * left alone: the black level the IPA subtracts with it is
++		 * already expressed on that same scale.
++		 */
+ 		sharedStats_->sum_ >>= sumShift_;
++		sharedStats_->sumNeutral_ >>= sumShift_;
+ 	}
+ 
+ 	sharedStats_->valid = valid;

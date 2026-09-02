@@ -1,0 +1,74 @@
+From f0bd353396b576c69bba4c70cdefdb779e45a9f2 Mon Sep 17 00:00:00 2001
+From: Martin Neiva de Carvalho <martin@12100collective.com>
+Date: Wed, 26 Aug 2026 21:07:09 -0300
+Subject: [PATCH 0/5] softisp: Five fixes found on a camera with no hardware ISP
+
+Five independent improvements to the software ISP, found while making the
+camera on an Intel IPU6 laptop usable. That platform has no open driver for
+the hardware ISP, so everything the picture gets, it gets from softisp - which
+makes it a fairly demanding test of it.
+
+Each patch stands alone and each carries its own measurement. Two of them are
+about the same underlying problem: statistics gathered before the gains are
+applied do not describe what the user will actually see.
+
+  1/4 adds a sensor helper for the OV02C10. Without it the AGC reads the
+      sensor's gain codes as multipliers - a code of 16 taken for 16x rather
+      than 1.0x - so it believes it already has all the gain it could want and
+      never asks for more. The picture stays dark.
+
+  2/4 excludes saturated pixels from the colour sums. A clipped pixel has lost
+      the ratio between its channels, so it can only pull the white balance
+      towards grey. Measured facing a bright window, the linear R/G rose from
+      0.855 to 0.944 and B/G from 0.942 to 0.986.
+
+  3/4 estimates white balance from the pixels that already look neutral rather
+      than from the whole frame. Grey world reads the average of the scene as
+      the colour of the light, so one large coloured object is taken for the
+      light and balanced away. On a scene with a blue door the walls came out
+      five percent short of red; restricting the estimate brought that to one
+      and a half.
+
+  4/4 takes the AGC's minimum gain step from the sensor instead of from a
+      fraction of its gain range. The two are unrelated: on a sensor whose
+      range runs from 1 to 248 the fraction is 2.47, so the smallest correction
+      the loop can make is around 12% at a typical indoor gain, and it can
+      never settle - every step crosses the target. Measured with the two
+      settings interleaved so that changing light could not favour either, the
+      brightness ripple falls from 2.80 to 0.38 DN RMS.
+
+4/4 is the one I would most like reviewed carefully: it changes the meaning of
+a configuration value that other sensors also use, and while a step taken from
+the sensor is correct for a linear gain law, I have only been able to test it
+on one.
+
+  5/5 centres the crop the GPU debayer applies to a stream whose aspect
+      ratio differs from the sensor's. It was taken entirely off one
+      side, so a 640x480 stream showed the sensor from x=48 instead of
+      from x=240, and the framing moved with the resolution the
+      application picked.
+
+The last two were found by registering streams of different sizes against
+each other, which measures framing rather than noise and so works in a dark
+room.
+
+Martin Neiva de Carvalho (5):
+  ipa: libipa: camera_sensor_helper: Add OV02C10
+  libcamera: software_isp: Exclude saturated pixels from colour sums
+  libcamera: software_isp: Estimate white balance from neutral pixels
+  ipa: softisp: Derive the minimum gain step from the sensor
+  libcamera: software_isp: Centre the crop the GPU debayer applies
+
+ .../internal/software_isp/swisp_stats.h       |  21 +++
+ .../internal/software_isp/swstats_cpu.h       |   5 +
+ src/ipa/libipa/camera_sensor_helper.cpp       |  12 ++
+ src/ipa/softisp/algorithms/awb.cpp            |  33 ++++-
+ src/ipa/softisp/softisp.cpp                   |  22 +++-
+ src/libcamera/software_isp/debayer_cpu.cpp    |   7 +
+ src/libcamera/software_isp/debayer_egl.cpp    |  30 ++++-
+ src/libcamera/software_isp/swstats_cpu.cpp    | 120 ++++++++++++++++--
+ 8 files changed, 226 insertions(+), 24 deletions(-)
+
+-- 
+2.55.0
+

@@ -1,0 +1,70 @@
+From 8c496cfb2bb0d72260284d28f8d0540cc1a0ccf4 Mon Sep 17 00:00:00 2001
+From: Martin Neiva de Carvalho <martin@12100collective.com>
+Date: Wed, 26 Aug 2026 15:12:35 -0300
+Subject: [PATCH 4/5] ipa: softisp: Derive the minimum gain step from the
+ sensor
+
+The AGC uses againMinStep to tell when a multiplicative correction is
+too small to reach the next gain code, so that it steps by one code
+rather than asking for a change that quantises away and stalls the
+loop. The value is currently taken as one hundredth of the gain range,
+which ties it to how much gain the sensor offers rather than to how
+finely that gain can be set.
+
+On a sensor with a wide range the two are far apart. With a range of 1
+to 248 the step becomes 2.47, so the smallest correction the AGC can
+make is around 12% at a typical indoor gain - much larger than the
+correction it is trying to make. Every step then crosses the target and
+the loop oscillates about it indefinitely, which is visible as the
+picture pulsing.
+
+Take the step from the sensor helper instead, as the gain difference
+between the two lowest codes. On an OV02C10, whose gain is linear in
+1/16 steps, this changes it from 2.47 to 0.0625. Measured over a static
+scene, with the two settings interleaved so that changing light could
+not favour either, the frame to frame brightness ripple around the
+trend drops from 2.80 to 0.38 DN RMS, and its peak to peak excursion
+from 9.5 to 2.3 DN.
+
+Signed-off-by: Martin Neiva de Carvalho <martin@12100collective.com>
+---
+ src/ipa/softisp/softisp.cpp | 22 +++++++++++++++++++---
+ 1 file changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/src/ipa/softisp/softisp.cpp b/src/ipa/softisp/softisp.cpp
+index aec04c528..5a20475b1 100644
+--- a/src/ipa/softisp/softisp.cpp
++++ b/src/ipa/softisp/softisp.cpp
+@@ -228,10 +228,26 @@ int IPASoftIsp::configure(const IPAConfigInfo &configInfo)
+ 		context_.configuration.agc.againMin = camHelper_->gain(againMin);
+ 		context_.configuration.agc.againMax = camHelper_->gain(againMax);
+ 		context_.configuration.agc.again10 = std::max(context_.configuration.agc.againMin, 1.0);
++		/*
++		 * The smallest gain change the sensor can actually make.
++		 *
++		 * The AGC needs this to know when a multiplicative correction
++		 * is too small to reach the next gain code, so that it steps
++		 * by one code instead of asking for a change that quantises
++		 * away and stalls the loop.
++		 *
++		 * Taking a fixed fraction of the total range instead ties the
++		 * step to how much gain the sensor offers, which is unrelated
++		 * to how finely it can be set. On a sensor whose range runs
++		 * from 1 to 248 that fraction is 2.47, so the smallest
++		 * correction the AGC can make is 12% at a typical indoor gain,
++		 * far larger than the correction it wants. The loop then
++		 * cannot settle: every step crosses the target and the
++		 * exposure oscillates about it indefinitely.
++		 */
+ 		context_.configuration.agc.againMinStep =
+-			(context_.configuration.agc.againMax -
+-			 context_.configuration.agc.againMin) /
+-			100.0;
++			camHelper_->gain(againMin + 1) -
++			camHelper_->gain(againMin);
+ 		if (camHelper_->blackLevel().has_value()) {
+ 			/*
+ 			 * The black level from camHelper_ is a 16 bit value, software ISP
+-- 
+2.55.0
+

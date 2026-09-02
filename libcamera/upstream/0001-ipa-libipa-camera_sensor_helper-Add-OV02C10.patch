@@ -1,0 +1,54 @@
+From 7bd39bd5b97dfd1aca8980bcc968d09f7a9fd70b Mon Sep 17 00:00:00 2001
+From: Martin Neiva de Carvalho <martin@12100collective.com>
+Date: Wed, 26 Aug 2026 07:29:51 -0300
+Subject: [PATCH 1/5] ipa: libipa: camera_sensor_helper: Add OV02C10
+
+The OmniVision OV02C10 is used as the front sensor on several Intel IPU6
+laptops, where it is driven by the software ISP and so depends on this
+helper to make sense of its gain control.
+
+V4L2_CID_ANALOGUE_GAIN on this sensor has a minimum and a default of
+0x10, which is unity gain, so the code is expressed in 1/16th steps.
+Without a helper the default one-to-one mapping is used, and the AGC
+reads the smallest gain the sensor will accept as 16x. It then believes
+the sensor is already amplifying heavily when it is not, and never
+raises the gain, leaving the image dark in anything but bright light.
+
+Verified by measurement on a Samsung Galaxy Book (NP960XGL): with the
+helper in place the AGC drives the control across its whole range and
+the resulting image level tracks the requested gain.
+
+The black level matches the 0x40 at 10 bits that the kernel driver
+programs as its BLC target.
+
+Signed-off-by: Martin Neiva de Carvalho <martin@12100collective.com>
+---
+ src/ipa/libipa/camera_sensor_helper.cpp | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/src/ipa/libipa/camera_sensor_helper.cpp b/src/ipa/libipa/camera_sensor_helper.cpp
+index 82bf255d2..d382d3e4f 100644
+--- a/src/ipa/libipa/camera_sensor_helper.cpp
++++ b/src/ipa/libipa/camera_sensor_helper.cpp
+@@ -714,6 +714,18 @@ public:
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("ov01a10", CameraSensorHelperOv01a10)
+ 
++class CameraSensorHelperOv02c10 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperOv02c10()
++	{
++		/* From Linux kernel driver: 0x40 at 10bits. */
++		blackLevel_ = 4096;
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 16 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("ov02c10", CameraSensorHelperOv02c10)
++
+ class CameraSensorHelperOv08d10 : public CameraSensorHelper
+ {
+ public:
+-- 
+2.55.0
+

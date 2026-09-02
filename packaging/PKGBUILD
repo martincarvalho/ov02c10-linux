@@ -1,0 +1,18 @@
+# Maintainer: Martin Neiva de Carvalho <martin@12100collective.com>
+pkgname=ov02c10-26mhz-dkms
+pkgver=1.0
+pkgrel=1
+pkgdesc="OV02C10 sensor driver for boards clocking it at 26 MHz (Samsung Galaxy Book)"
+arch=('any')
+url="https://github.com/REPLACE_ME/ov02c10-linux"
+license=('GPL-2.0-only')
+depends=('dkms')
+provides=('ov02c10')
+source=('ov02c10.c' 'dkms.conf' 'Makefile')
+sha256sums=('SKIP' 'SKIP' 'SKIP')
+
+package() {
+  install -Dm644 "$srcdir/ov02c10.c" "$pkgdir/usr/src/ov02c10-26mhz-$pkgver/ov02c10.c"
+  install -Dm644 "$srcdir/Makefile"  "$pkgdir/usr/src/ov02c10-26mhz-$pkgver/Makefile"
+  install -Dm644 "$srcdir/dkms.conf" "$pkgdir/usr/src/ov02c10-26mhz-$pkgver/dkms.conf"
+}
