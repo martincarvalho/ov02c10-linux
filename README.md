@@ -225,6 +225,13 @@ weeks without anyone noticing: generated with a plain `git diff` in a tree that
 is a package extraction, it carried the distribution's own patches along with
 it, and conflicted with them on the next extraction.
 
+## How this was measured
+
+Every number here came from an A/B with the control repeated on both sides, and
+four conclusions were thrown away because the control disagreed with itself. The
+method, and the six ways the measurements were contaminated before that habit
+caught them, are in [docs/measuring.md](docs/measuring.md).
+
 ## Licence
 
 `kernel/` is GPL-2.0-only, matching the driver it derives from. The libcamera
