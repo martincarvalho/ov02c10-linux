@@ -150,6 +150,12 @@ that is not centred.
 
 ![Flat field](images/flat-field.jpg)
 
+The coefficients are measured on the module in this laptop and are compiled in.
+Another OV02C10 of the same part should be close, but a different lens or
+different mechanical vignetting will not be — if the edges of your frame come
+out tinted the other way, that is why, and the flat-field recipe below is how to
+measure your own.
+
 Colour and brightness are corrected separately because they cost differently.
 Flattening the colour is nearly free and is on by default. Flattening the
 brightness needs a gain of four at the corners and multiplies the noise there by
