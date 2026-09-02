@@ -1,6 +1,6 @@
-From cf5a9cbae6a3e4b0ebafc3897e6a9cc04aad6e9a Mon Sep 17 00:00:00 2001
-From: Martin Neiva de Carvalho <martin@12100collective.com>
-Date: Wed, 26 Aug 2026 07:35:01 -0300
+From 7c6e4a910f1430ef21712840dd3c03f65de3353d Mon Sep 17 00:00:00 2001
+From: Martin Neiva de Carvalho <martincarvalho@gmail.com>
+Date: Wed, 2 Sep 2026 14:59:14 -0300
 Subject: [PATCH 3/5] libcamera: software_isp: Estimate white balance from
  neutral pixels
 
@@ -32,7 +32,7 @@ neutral. That covers a genuinely monochrome scene, and it covers the
 first frames, where the gains have not converged, nothing would qualify,
 and the estimate could otherwise never get started.
 
-Signed-off-by: Martin Neiva de Carvalho <martin@12100collective.com>
+Signed-off-by: Martin Neiva de Carvalho <martincarvalho@gmail.com>
 ---
  .../internal/software_isp/swisp_stats.h       | 13 +++
  .../internal/software_isp/swstats_cpu.h       |  5 ++

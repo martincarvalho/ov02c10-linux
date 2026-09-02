@@ -1,6 +1,6 @@
-From 7bd39bd5b97dfd1aca8980bcc968d09f7a9fd70b Mon Sep 17 00:00:00 2001
-From: Martin Neiva de Carvalho <martin@12100collective.com>
-Date: Wed, 26 Aug 2026 07:29:51 -0300
+From a3b8705d534a32c38484427a0d9c42f01c9b1869 Mon Sep 17 00:00:00 2001
+From: Martin Neiva de Carvalho <martincarvalho@gmail.com>
+Date: Wed, 2 Sep 2026 14:59:14 -0300
 Subject: [PATCH 1/5] ipa: libipa: camera_sensor_helper: Add OV02C10
 
 The OmniVision OV02C10 is used as the front sensor on several Intel IPU6
@@ -21,7 +21,7 @@ the resulting image level tracks the requested gain.
 The black level matches the 0x40 at 10 bits that the kernel driver
 programs as its BLC target.
 
-Signed-off-by: Martin Neiva de Carvalho <martin@12100collective.com>
+Signed-off-by: Martin Neiva de Carvalho <martincarvalho@gmail.com>
 ---
  src/ipa/libipa/camera_sensor_helper.cpp | 12 ++++++++++++
  1 file changed, 12 insertions(+)

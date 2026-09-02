@@ -1,6 +1,6 @@
-From 8c496cfb2bb0d72260284d28f8d0540cc1a0ccf4 Mon Sep 17 00:00:00 2001
-From: Martin Neiva de Carvalho <martin@12100collective.com>
-Date: Wed, 26 Aug 2026 15:12:35 -0300
+From 3445654eee5eaaaf19e34a8fa25c9b97bb73263a Mon Sep 17 00:00:00 2001
+From: Martin Neiva de Carvalho <martincarvalho@gmail.com>
+Date: Wed, 2 Sep 2026 14:59:14 -0300
 Subject: [PATCH 4/5] ipa: softisp: Derive the minimum gain step from the
  sensor
 
@@ -26,7 +26,7 @@ not favour either, the frame to frame brightness ripple around the
 trend drops from 2.80 to 0.38 DN RMS, and its peak to peak excursion
 from 9.5 to 2.3 DN.
 
-Signed-off-by: Martin Neiva de Carvalho <martin@12100collective.com>
+Signed-off-by: Martin Neiva de Carvalho <martincarvalho@gmail.com>
 ---
  src/ipa/softisp/softisp.cpp | 22 +++++++++++++++++++---
  1 file changed, 19 insertions(+), 3 deletions(-)

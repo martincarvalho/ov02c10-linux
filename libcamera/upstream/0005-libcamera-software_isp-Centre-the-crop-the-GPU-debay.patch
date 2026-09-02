@@ -1,6 +1,6 @@
-From f0bd353396b576c69bba4c70cdefdb779e45a9f2 Mon Sep 17 00:00:00 2001
-From: Martin Neiva de Carvalho <martin@12100collective.com>
-Date: Wed, 26 Aug 2026 21:06:57 -0300
+From 69f57c44795570e41c30540bcf558a06f0879d3c Mon Sep 17 00:00:00 2001
+From: Martin Neiva de Carvalho <martincarvalho@gmail.com>
+Date: Wed, 2 Sep 2026 14:59:14 -0300
 Subject: [PATCH 5/5] libcamera: software_isp: Centre the crop the GPU debayer
  applies
 
@@ -35,7 +35,7 @@ Bayer border between the two edges rather than taking them all off one,
 moving the picture by half a border. Nothing is resampled: the viewport
 and the scale factor are untouched.
 
-Signed-off-by: Martin Neiva de Carvalho <martin@12100collective.com>
+Signed-off-by: Martin Neiva de Carvalho <martincarvalho@gmail.com>
 ---
  src/libcamera/software_isp/debayer_egl.cpp | 23 +++++++++++++++++++---
  1 file changed, 20 insertions(+), 3 deletions(-)

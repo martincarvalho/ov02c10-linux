@@ -1,6 +1,6 @@
-From de4a56a8114998a2b7cb2f517a3546ab863783a5 Mon Sep 17 00:00:00 2001
-From: Martin Neiva de Carvalho <martin@12100collective.com>
-Date: Wed, 26 Aug 2026 07:31:09 -0300
+From fd28b23d82dba286881a817aed7afcbbfd52dced Mon Sep 17 00:00:00 2001
+From: Martin Neiva de Carvalho <martincarvalho@gmail.com>
+Date: Wed, 2 Sep 2026 14:59:14 -0300
 Subject: [PATCH 2/5] libcamera: software_isp: Exclude saturated pixels from
  colour sums
 
@@ -22,7 +22,7 @@ Keep a separate count of the pixels that did contribute, because the
 black level the IPA subtracts from the sums is a per-pixel offset and
 would otherwise be scaled by the wrong number.
 
-Signed-off-by: Martin Neiva de Carvalho <martin@12100collective.com>
+Signed-off-by: Martin Neiva de Carvalho <martincarvalho@gmail.com>
 ---
  .../internal/software_isp/swisp_stats.h       |  8 ++++
  src/ipa/softisp/algorithms/awb.cpp            | 15 +++++--
