@@ -75,6 +75,10 @@ OV02C10 sensor helper, without which the AGC reads the sensor's gain codes as
 multipliers — a code of 16 taken for 16× rather than 1.0× — believes it already
 has all the gain it could want, and leaves the picture dark.
 
+Submitted to libcamera-devel on 2 September 2026 as *"softisp: Five fixes found
+on a camera with no hardware ISP"*, and under review. The thread is in the
+[list archive](https://lists.libcamera.org/pipermail/libcamera-devel/).
+
 Everything else lives in [`libcamera/softisp-ov02c10.patch`](libcamera/), which
 is larger and not yet proposed upstream.
 
